@@ -19,10 +19,12 @@
 
 # ==================== Keil MDK-ARM 编译产物 ====================
 # 输出目录(整个目录都是 rebuild 出来的)
-MDK-ARM/JiGuang/
-MDK-ARM/Objects/
-MDK-ARM/Listings/
-MDK-ARM/DebugConfig/
+# ⚠ 注意 gitignore 锚定语义: 含 "/" 的规则只锚定到本文件所在目录,
+#   故这里必须加 **/ 前缀, 才能同时命中 F405RGT6/MDK-ARM/ 这类子目录路径
+**/MDK-ARM/JiGuang/
+**/MDK-ARM/Objects/
+**/MDK-ARM/Listings/
+**/MDK-ARM/DebugConfig/
 
 # 中间目标文件与依赖
 *.o
@@ -58,9 +60,8 @@ JLinkLog.txt
 *.__i
 *._ia
 
-# RTE 自动生成头 (Keil 勾选组件时重新生成, 不入库)
-# 只排这一个自动生成文件, 不用整目录排除以免误伤
-MDK-ARM/RTE/_JiGuang/RTE_Components.h
+# RTE 自动生成目录 (Keil 勾选组件时重新生成, 不入库)
+**/MDK-ARM/RTE/
 
 # ==================== STM32CubeMX ====================
 .mxproject
