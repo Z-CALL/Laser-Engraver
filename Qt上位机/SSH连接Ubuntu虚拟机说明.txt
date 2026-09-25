@@ -1,0 +1,55 @@
+================================================================
+ AI 通过 SSH 连接 Ubuntu 虚拟机 - 连接说明
+ 生成日期：2026-09-03
+================================================================
+
+【一、基本信息】
+- 虚拟机系统：Ubuntu 16.04.7 LTS（正点原子镜像，主机名 ubuntu16）
+- 用户名：alientek
+- IP 地址：192.168.137.128（网卡 ens33，VMware）
+- 备用 IP：192.168.95.129（网卡 ens37）
+- SSH 端口：22（默认）
+
+【二、连接方式（Windows 侧直接执行）】
+- 免密钥钥登录，私钥位置：C:\Users\27594\.ssh\id_ed25519
+- 公钥指纹：ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIwKVY7XFrz91+
+  EfinAhubuD8rEcTj5vfyemk451+LVN workbuddy-ai
+- 连接命令：
+
+  ssh -o BatchMode=yes -o ConnectTimeout=6 alientek@192.168.137.128 '命令'
+
+【三、前提条件】
+1. 虚拟机处于开机状态
+2. 虚拟机已安装并启动 ssh 服务：
+   sudo apt install openssh-server -y
+   sudo systemctl enable --now ssh
+3. 公钥已写入虚拟机的 ~/.ssh/authorized_keys（2026-09-03 已完成）
+
+【四、如果连不上了，按顺序排查】
+1. IP 变了（最常见，虚拟机重启后 DHCP 可能换 IP）：
+   在虚拟机里执行 ip a 查看新 IP，替换 192.168.137.128
+2. 权限被改回去：
+   如果报 "Permission denied (publickey,password)"，
+   在虚拟机里执行 sudo tail -20 /var/log/auth.log 看原因。
+   若出现 "bad ownership or modes for directory /home/alientek"，
+   执行：chmod go-w /home/alientek
+   （正点原子镜像 home 目录默认 777，会导致 sshd 拒绝公钥认证，
+    2026-09-03 已修复过一次，别再用 chmod 777 改回去）
+3. ssh 服务没启动：
+   在虚拟机里执行 sudo systemctl start ssh
+4. 网络不通：Windows 侧 ping 192.168.137.128 测试，
+   检查 VMware 网络模式是否还是原来的（NAT/桥接）
+
+【五、连接成功的验证输出（参考）】
+SSH_OK
+alientek
+Linux ubuntu16 4.15.0-142-generic #146~16.04.1-Ubuntu x86_64
+Ubuntu 16.04.7 LTS
+
+【六、该虚拟机的用途备注】
+- 用于 IMX6ULL 开发：交叉编译工具链、内核源码编译等
+- 桌面有 ffmpeg 相关目录（~/Desktop/ffmpeg）
+
+================================================================
+使用方法：明天把本文件发给 AI，AI 读取后即可按第二节直接连接。
+================================================================

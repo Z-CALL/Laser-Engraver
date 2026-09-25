@@ -1,0 +1,114 @@
+# ====================================================================
+# 激光雕刻机工程 —— 仓库级忽略规则
+# F405RGT6 (Keil MDK / STM32) + Qt上位机 (qmake / Qt Creator)
+# 原则: 只入库源码与工程配置, 所有可重新生成的编译产物一律忽略
+# ====================================================================
+
+# ==================== 旧仓库备份 / 嵌套 git ====================
+# 内层仓库(曾各自独立)已迁移为单仓库, 其 .git 备份不参与版本控制
+.git.bak-*/
+.git.bak-*
+.git/
+
+# ==================== 编辑器 / IDE 会话数据 ====================
+.workbuddy/
+.vscode/
+.idea/
+.qtc_clangd/
+*.autosave
+
+# ==================== Keil MDK-ARM 编译产物 ====================
+# 输出目录(整个目录都是 rebuild 出来的)
+MDK-ARM/JiGuang/
+MDK-ARM/Objects/
+MDK-ARM/Listings/
+MDK-ARM/DebugConfig/
+
+# 中间目标文件与依赖
+*.o
+*.d
+*.crf
+*.dep
+*.d.*
+*.lnp
+*.iex
+*.sct
+*.lst
+
+# 链接与镜像产物
+*.axf
+*.elf
+*.hex
+*.bin
+*.map
+
+# 构建日志与调试器文件
+*.build_log.htm
+*.htm
+*.log
+*.scvd
+JLinkLog.txt
+*.dbgconf
+
+# Keil 自动备份
+*.bak
+*.bak[0-9]*
+*.bak-*
+*.uvguix.*
+*.__i
+*._ia
+
+# RTE 自动生成头 (Keil 勾选组件时重新生成, 不入库)
+# 只排这一个自动生成文件, 不用整目录排除以免误伤
+MDK-ARM/RTE/_JiGuang/RTE_Components.h
+
+# ==================== STM32CubeMX ====================
+.mxproject
+
+# 顶层生成的临时编译产物
+*.su
+*.user
+*.user.*
+
+# ==================== Qt / qmake 编译产物 ====================
+build/
+debug/
+release/
+ui_*.h
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+Makefile
+Makefile.Debug
+Makefile.Release
+Makefile.*
+object_script*
+*.qmake.stash
+*.pro.user
+*.pro.user.*
+
+# ==================== 动态库 / 可执行 / 符号 ====================
+*.exe
+*.dll
+*.so
+*.so.*
+*.dylib
+*.a
+*.lib
+*.pdb
+*.obj
+*.ilk
+
+# ==================== 大体量导出产物 ====================
+# 灰度数组导出头文件, 由上位机重新导出即可
+gray_image.h
+
+# ==================== 临时与备份文件 ====================
+*.orig
+*.tmp
+*.temp
+*.stash
+*~
+Thumbs.db
+Desktop.ini
+.DS_Store

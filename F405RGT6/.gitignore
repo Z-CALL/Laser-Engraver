@@ -1,0 +1,31 @@
+# Keil MDK-ARM build outputs
+MDK-ARM/JiGuang/
+MDK-ARM/*.bak
+MDK-ARM/*.bak-*
+MDK-ARM/*.dep
+MDK-ARM/*.lnp
+MDK-ARM/*.htm
+MDK-ARM/*.map
+MDK-ARM/*.lst
+MDK-ARM/*.build_log.htm
+MDK-ARM/*.scvd
+MDK-ARM/JLinkLog.txt
+MDK-ARM/Objects/
+MDK-ARM/Listings/
+MDK-ARM/DebugConfig/*.dbgconf
+
+# RTE generated
+MDK-ARM/RTE/_JiGuang/RTE_Components.h
+
+# CubeMX
+.mxproject
+
+# Misc
+*.o
+*.d
+*.crf
+*.axf
+*.hex
+*.bin
+*.elf
+*.uvguix.*
