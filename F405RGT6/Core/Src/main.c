@@ -150,8 +150,6 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-
-      /* 把 DMA 收好的数据搬进 row_buffer（无新数据时几乎零开销） */
 //      USART3_DMA_BufferTask();
 
       if(y.cur_point >= y.all_point){

@@ -230,18 +230,18 @@ void TIM2_IRQHandler(void)
 {
   if ((TIM2->SR & TIM_SR_UIF) != 0U)
   {
-    TIM2->SR &= ~TIM_SR_UIF;              /* 清更新中断标志, 否则会反复进中断 */
+    TIM2->SR &= ~TIM_SR_UIF;
 
-	  if(HAL_GPIO_ReadPin(x_limit_r_grop,x_limit_r_pin) == x_limit_r_active){   /* X 右: 低有效 */
+	  if(HAL_GPIO_ReadPin(x_limit_r_grop,x_limit_r_pin) == x_limit_r_active){
 		  return;
 	  }
-	  if(HAL_GPIO_ReadPin(x_limit_l_grop,x_limit_l_pin) == x_limit_l_active){   /* X 左: 低有效 */
+	  if(HAL_GPIO_ReadPin(x_limit_l_grop,x_limit_l_pin) == x_limit_l_active){
 		  return;
 	  }
-	  if(HAL_GPIO_ReadPin(y_limit_d_grop,y_limit_d_pin) == y_limit_d_active){   /* Y 下: 高有效 */
+	  if(HAL_GPIO_ReadPin(y_limit_d_grop,y_limit_d_pin) == y_limit_d_active){
 		  return;
 	  }
-	  if(HAL_GPIO_ReadPin(y_limit_u_grop,y_limit_u_pin) == y_limit_u_active){   /* Y 上: 高有效 */
+	  if(HAL_GPIO_ReadPin(y_limit_u_grop,y_limit_u_pin) == y_limit_u_active){
 		  return;
 	  }
 	  
@@ -254,7 +254,7 @@ void TIM2_IRQHandler(void)
         y.lock = 0;
       }
     }else{
-	  HAL_GPIO_TogglePin(x_plus_grop, x_plus_pin);   /* 翻转 PC9 -> 输出一个步进脉冲 */
+	  HAL_GPIO_TogglePin(x_plus_grop, x_plus_pin);
       x.divide_step ++;
       if (x.divide_step >= step_divide_x2)
       {
@@ -266,7 +266,7 @@ void TIM2_IRQHandler(void)
 
     if (x.cur_point >= x.all_point)
     {
-      y.lock = 1;                            /* 本行走完, 通知主循环换行 */
+      y.lock = 1;
       x.cur_point = 0;
       HAL_GPIO_TogglePin(x_dir_grop, x_dir_pin);
     }

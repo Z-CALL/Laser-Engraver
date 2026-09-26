@@ -403,25 +403,13 @@ HAL_StatusTypeDef USART3_StartReceiveDMA(void)
   dma_event         = 0;
   half_busy_flag    = 0;
   dma_rx_block_count = 0;
-
-  /* 用 DMA 硬件双缓冲模式(Double Buffer Mode)：
-     - Memory0 = dma_buffer            前半段
-     - Memory1 = dma_buffer + HALF     后半段
-     硬件会在两段之间自动切换 CT 位，DMA 永不停歇，天然规避 Overrun。
-     注意：xfer 长度传的就是"半缓冲"长度。*/
-  status = HAL_DMAEx_MultiBufferStart_IT(&hdma_usart3_rx,
-                                         (uint32_t)&USART3->DR,
-                                         (uint32_t)&dma_buffer[0],
-                                         (uint32_t)&dma_buffer[ROW_BUFFER_SIZE],
-                                         ROW_BUFFER_SIZE);
+  status = HAL_DMAEx_MultiBufferStart_IT(&hdma_usart3_rx,(uint32_t)&USART3->DR,(uint32_t)&dma_buffer[0],(uint32_t)&dma_buffer[ROW_BUFFER_SIZE],ROW_BUFFER_SIZE);
 
   if (status != HAL_OK)
   {
     return status;
   }
 
-  /* 让 UART 侧把 USART3 的 DMAR 请求打开，并记录本次接收长度。
-     这一步 HAL 内部会做：清 ORE 标志 -> 使能 EIE -> 置 CR3_DMAR。*/
   huart3.pRxBuffPtr = &dma_buffer[0];
   huart3.RxXferSize = ROW_BUFFER_SIZE;
   huart3.RxState    = HAL_UART_STATE_BUSY_RX;
