@@ -123,7 +123,7 @@ int main(void)
   y.all_point = GRAY_IMG_H;
   x.all_point = GRAY_IMG_W;
 
-  HAL_GPIO_TogglePin(x_dir_grop, x_dir_pin);
+  //HAL_GPIO_TogglePin(x_dir_grop, x_dir_pin);
   HAL_GPIO_TogglePin(y_dir_grop, y_dir_pin);
   
   htim2.Init.Period    = RASTER_TIM2_PERIOD;
