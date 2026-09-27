@@ -42,30 +42,7 @@ extern "C" {
 
 /* Exported types ------------------------------------------------------------*/
 /* USER CODE BEGIN ET */
-//雕刻速度：单位mm/s
-#define SPEED 60
-//步进电机的细分
-#define STEP_DIVIDE 16
-//buffer缓冲区大小
-#define ROW_BUFFER_SIZE 4096
 
-/* ===================== ★ 扫描中断频率(唯一旋钮) =====================
-   由 TIM2 的自动重装值决定(定时器时钟 84MHz):
-       中断频率 = 84e6 / (RASTER_TIM2_PERIOD + 1)
-       一个"点" = STEP_DIVIDE x 2 次 STEP 翻转
-
-       PERIOD 2624 -> 32.0 kHz -> 302 点/s -> 30 mm/s   (原值)
-       PERIOD 5249 -> 16.0 kHz -> 151 点/s -> 15 mm/s   <-- 当前: 用户要求频率减半
-       PERIOD 10499 ->  8.0 kHz ->  75 点/s ->  7.5 mm/s
-
-   ★ 中断频率减半 = 每个点的时间翻倍 -> **扫描速度也减半**(30 -> 15mm/s),
-     作业时长翻倍。要"只降中断频率不降速度"是做不到的:
-       点率 = 中断频率 / (STEP_DIVIDE x 2), 而 STEP_DIVIDE 同时决定点距。
-   ★ 为什么在这里设而不是改 tim.c: tim.c 是 CubeMX 生成的, 重新生成就被覆盖;
-     放在 main.h + main.c 的 USER CODE 区里就一直是我们的。
-   ⚠ 顺带: 点周期变长(3312 -> 6625us), 激光脉宽的上限也必须小于它
-     (脉宽 = 灰度 x LASER_POWER, 见 main.c; 6625us 下 LASER_POWER 别超过 20)。 */
-#define RASTER_TIM2_PERIOD      2625U
 
 /* ===================== 蓝牙串口 DMA 双缓冲配置 ===================== */
 /* DMA 缓冲区(第二个缓冲区)：DMA 把 USART3 收到的灰度值直接搬到这里，CPU 不参与 */
