@@ -120,8 +120,8 @@ int main(void)
   
   OLED_Init();
   
-  y.all_point = 1000;
-  x.all_point = 522;
+  y.all_point = GRAY_IMG_H;
+  x.all_point = GRAY_IMG_W;
 
   HAL_GPIO_TogglePin(x_dir_grop, x_dir_pin);
   HAL_GPIO_TogglePin(y_dir_grop, y_dir_pin);
@@ -165,7 +165,7 @@ int main(void)
         x.add_flag = 0;
         laser_open();
         //set_delay_time(((test_image[y.cur_point][x.cur_point]/25U) + 1) *240);
-        alarm = Creat_alarm(test_image[y.cur_point][x.cur_point] * 9);
+        alarm = Creat_alarm(gray_image[y.cur_point][x.cur_point] * 9);
         if(alarm == NULL){
             HAL_TIM_Base_Stop_IT(&htim2);
             char program_error[] = {"program error!!!"};

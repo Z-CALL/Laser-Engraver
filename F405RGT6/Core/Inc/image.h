@@ -3,6 +3,11 @@
 
 #include "main.h"
 #include "image.h"
-extern const uint8_t test_image[1000][522];
+
+
+#define GRAY_IMG_W  683
+#define GRAY_IMG_H  1000
+
+extern const uint8_t gray_image[GRAY_IMG_H][GRAY_IMG_W];
 
 #endif
