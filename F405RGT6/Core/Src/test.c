@@ -55,4 +55,22 @@ void test_delay(){
 	while(1);
 }
 
+void test_homing(){
+    homing();
+    while(1);
+}
+
+void test_go_to_point(){
+	goto_point(100,100);
+	goto_point(1000,100);
+	goto_point(1000,1000);
+	goto_point(100,1000);
+	goto_point(500,500);
+	goto_point(100,100);
+	goto_point(1000,100);
+	goto_point(1000,1000);
+	goto_point(100,1000);
+	goto_point(500,500);
+	while(1);
+}
 

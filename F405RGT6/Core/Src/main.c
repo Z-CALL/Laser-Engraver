@@ -56,6 +56,7 @@ uint8_t  row_buffer[ROW_BUFFER_SIZE];
 uint32_t read_cusor = 0;
 uint32_t write_cusor = 0;
 conformation x, y;
+volatile state sys_state;
 uint8_t* alarm;
 
 uint8_t dma_buffer[DMA_BUFFER_SIZE];
@@ -122,9 +123,20 @@ int main(void)
   
   y.all_point = GRAY_IMG_H;
   x.all_point = GRAY_IMG_W;
+  
+  //test_homing();
+  if(homing() == 1){
+	char program_error[] = {"Homing success!"};
+	OLED_ShowString(0, 0, program_error, OLED_FONT_08, 1);
+	OLED_Refresh();
+  }else{
+	char program_error[] = {"Homing error!!!"};
+	OLED_ShowString(0, 0, program_error, OLED_FONT_08, 1);
+	OLED_Refresh();
+  }
+  
+  test_go_to_point();
 
-  //HAL_GPIO_TogglePin(x_dir_grop, x_dir_pin);
-  HAL_GPIO_TogglePin(y_dir_grop, y_dir_pin);
   
   htim2.Init.Period    = RASTER_TIM2_PERIOD;
   htim2.Init.Prescaler = 0U;

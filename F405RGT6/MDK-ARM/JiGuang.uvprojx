@@ -206,7 +206,7 @@
             <Ro2Chk>0</Ro2Chk>
             <Ro3Chk>0</Ro3Chk>
             <Ir1Chk>1</Ir1Chk>
-            <Ir2Chk>1</Ir2Chk>
+            <Ir2Chk>0</Ir2Chk>
             <Ra1Chk>0</Ra1Chk>
             <Ra2Chk>0</Ra2Chk>
             <Ra3Chk>0</Ra3Chk>
@@ -313,7 +313,7 @@
           </ArmAdsMisc>
           <Cads>
             <interw>1</interw>
-            <Optim>4</Optim>
+            <Optim>1</Optim>
             <oTime>0</oTime>
             <SplitLS>0</SplitLS>
             <OneElfS>1</OneElfS>
@@ -524,11 +524,6 @@
               <FilePath>..\Core\Inc\oled.h</FilePath>
             </File>
             <File>
-              <FileName>pin_configure.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>..\Core\Inc\pin_configure.h</FilePath>
-            </File>
-            <File>
               <FileName>spi.h</FileName>
               <FileType>5</FileType>
               <FilePath>..\Core\Inc\spi.h</FilePath>
@@ -577,6 +572,16 @@
               <FileName>image.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Core\Src\image.c</FilePath>
+            </File>
+            <File>
+              <FileName>configure.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\configure.c</FilePath>
+            </File>
+            <File>
+              <FileName>configure.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\Inc\configure.h</FilePath>
             </File>
           </Files>
         </Group>
@@ -739,5 +744,14 @@
     </components>
     <files/>
   </RTE>
+
+  <LayerInfo>
+    <Layers>
+      <Layer>
+        <LayName>JiGuang</LayName>
+        <LayPrjMark>1</LayPrjMark>
+      </Layer>
+    </Layers>
+  </LayerInfo>
 
 </Project>

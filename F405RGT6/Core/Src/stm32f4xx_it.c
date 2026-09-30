@@ -232,44 +232,91 @@ void TIM2_IRQHandler(void)
   {
     TIM2->SR &= ~TIM_SR_UIF;
 
-	  if(HAL_GPIO_ReadPin(x_limit_r_grop,x_limit_r_pin) == x_limit_r_active){
-		  return;
-	  }
-	  if(HAL_GPIO_ReadPin(x_limit_l_grop,x_limit_l_pin) == x_limit_l_active){
-		  return;
-	  }
-	  if(HAL_GPIO_ReadPin(y_limit_d_grop,y_limit_d_pin) == y_limit_d_active){
-		  return;
-	  }
-	  if(HAL_GPIO_ReadPin(y_limit_u_grop,y_limit_u_pin) == y_limit_u_active){
-		  return;
-	  }
-	  
-    if(y.lock == 1){
-      HAL_GPIO_TogglePin(y_plus_grop, y_plus_pin);
-      y.divide_step++;
-      if( y.divide_step >= step_divide_x2){
-        y.cur_point++;
-        y.divide_step = 0;
-        y.lock = 0;
-      }
-    }else{
-	  HAL_GPIO_TogglePin(x_plus_grop, x_plus_pin);
-      x.divide_step ++;
-      if (x.divide_step >= step_divide_x2)
-      {
-        x.cur_point++;
-        x.divide_step = 0U;
-        x.add_flag = 1;
-      }
+    switch(sys_state)
+    {
+      case working:
+          if(HAL_GPIO_ReadPin(x_limit_r_grop,x_limit_r_pin) == x_limit_r_active){
+            return;
+          }
+          if(HAL_GPIO_ReadPin(x_limit_l_grop,x_limit_l_pin) == x_limit_l_active){
+            return;
+          }
+          if(HAL_GPIO_ReadPin(y_limit_d_grop,y_limit_d_pin) == y_limit_d_active){
+            return;
+          }
+          if(HAL_GPIO_ReadPin(y_limit_u_grop,y_limit_u_pin) == y_limit_u_active){
+            return;
+          }
+          
+          if(y.lock == 1){
+            HAL_GPIO_TogglePin(y_plus_grop, y_plus_pin);
+            y.divide_step++;
+            if( y.divide_step >= step_divide_x2){
+              y.cur_point++;
+              y.divide_step = 0;
+              y.lock = 0;
+            }
+          }else{
+          HAL_GPIO_TogglePin(x_plus_grop, x_plus_pin);
+            x.divide_step ++;
+            if (x.divide_step >= step_divide_x2)
+            {
+              x.cur_point++;
+              x.divide_step = 0U;
+              x.add_flag = 1;
+            }
+          }
+
+          if (x.cur_point >= x.all_point)
+          {
+            y.lock = 1;
+            x.cur_point = 0;
+            HAL_GPIO_TogglePin(x_dir_grop, x_dir_pin);
+          }
+          break;
+      case homing_1:
+          if(y.lock == 0){
+            HAL_GPIO_TogglePin(y_plus_grop, y_plus_pin);
+          }
+          if(x.lock == 0){
+            HAL_GPIO_TogglePin(x_plus_grop, x_plus_pin);
+          }
+          break;
+      case homing_2:
+          static uint32_t homing_2_times = 0;
+          HAL_GPIO_TogglePin(y_plus_grop, y_plus_pin);
+          HAL_GPIO_TogglePin(x_plus_grop, x_plus_pin);
+          homing_2_times++;
+          if(homing_2_times >= STEP_DIVIDE*400){
+            homing_2_times = 0;
+            sys_state = homing_3;
+            return;
+          }
+          break;
+      case homing_3:
+          if(y.lock == 0){
+            HAL_GPIO_TogglePin(y_plus_grop, y_plus_pin);
+          }
+          if(x.lock == 0){
+            HAL_GPIO_TogglePin(x_plus_grop, x_plus_pin);
+          }
+          break;
+      case homing_4:
+          static uint32_t homing_4_times = 0;
+          HAL_GPIO_TogglePin(y_plus_grop, y_plus_pin);
+          HAL_GPIO_TogglePin(x_plus_grop, x_plus_pin);
+          homing_4_times++;
+          if(homing_4_times >= STEP_DIVIDE*400){
+            homing_4_times = 0;
+            sys_state = idle;
+            return;
+          }
+          break;
+      default:
+          break;
+
     }
 
-    if (x.cur_point >= x.all_point)
-    {
-      y.lock = 1;
-      x.cur_point = 0;
-      HAL_GPIO_TogglePin(x_dir_grop, x_dir_pin);
-    }
   }
   /* USER CODE END TIM2_IRQn 0 */
   /* USER CODE BEGIN TIM2_IRQn 1 */

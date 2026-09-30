@@ -28,10 +28,11 @@ extern "C" {
 
 /* Includes ------------------------------------------------------------------*/
 #include "stm32f4xx_hal.h"
+#include "tim.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "pin_configure.h"
+#include "configure.h"
 #include "bsp_delay.h"
 #include "laser.h"
 #include "step_motor.h"
@@ -60,22 +61,35 @@ typedef struct conformation{
    uint32_t all_point;
    uint32_t cur_point;
    uint8_t add_flag;
-   uint8_t lock;
-   uint8_t divide_step;
+   volatile uint8_t lock;
+   volatile uint8_t divide_step;
 }conformation;
 
+typedef enum state{
+   homing_1,
+   homing_2,
+   homing_3,
+   homing_4,
+   idle,
+   working,
+   edge,
+   speed_release,
+   speed_add,
+}state;
+
    extern conformation x, y; 
+   extern volatile state sys_state;
    extern uint8_t  row_buffer[ROW_BUFFER_SIZE];
-   extern uint32_t read_cusor;         //图像灰度值的读游标
-   extern uint32_t write_cusor;        //图像灰度值的写游标
+   extern uint32_t read_cusor;
+   extern uint32_t write_cusor;
    extern int      cur_count;
-   extern int      row_count;          //图像总共有多少列
-   extern int      line_count;         //图像总共有多少行
-   extern int      row_count_2;        //直接算出GPIO需要翻转的次数
+   extern int      row_count;
+   extern int      line_count;
+   extern int      row_count_2;
    extern uint8_t  step_count;
    extern int      line_couant_2;
-   extern uint8_t  row_add;            //被置1了就代表已经到达下一个像素点了
-   extern uint8_t  line_add;           //被置1了就是要换行了
+   extern uint8_t  row_add;
+   extern uint8_t  line_add;
 
   /* ---------------- DMA 双缓冲区相关变量 ---------------- */
   /* 第二个缓冲区：DMA(USART3_RX) 的目的地。
