@@ -153,7 +153,7 @@ int main(void)
   /* 启动蓝牙串口(USART3)的 DMA 双缓冲接收：
      DMA 从此开始把上位机下发的像素灰度值循环搬进 dma_buffer，
      收满前半段/后半段时会在 DMA1_Stream1 中断里置 dma_event 提醒 CPU。*/
-//  USART3_StartReceiveDMA();
+ USART3_StartReceiveDMA();
 
   /* USER CODE END 2 */
 

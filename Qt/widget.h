@@ -3,6 +3,7 @@
 
 #include <QWidget>
 #include <QImage>
+#include <QElapsedTimer>
 
 class QLabel;
 class QLineEdit;
@@ -14,6 +15,8 @@ class QPlainTextEdit;
 class QListWidget;
 class QListWidgetItem;
 class QStackedWidget;
+class QProgressBar;
+class SerialIo;
 
 namespace Ui {
 class Widget;
@@ -33,10 +36,29 @@ public:
     explicit Widget(QWidget *parent = 0);
     ~Widget();
 
+    /* SerialIo 日志回调的落点（供 C 风格回调函数调用） */
+    void appendSerialLog(const QString &line);
+
 private slots:
     void onOpenImage();       /* 载入图片 */
     void refreshGray();       /* 按当前参数重算灰度与预览 */
     void onSaveGrayArray();   /* 导出灰度 C 二维数组 */
+
+    /* 串口面板 */
+    void onSerialRefresh();   /* 重新枚举端口 */
+    void onSerialOpenClose(); /* 打开/关闭串口 */
+    void onSerialSend();      /* 按新协议下发整幅图 */
+    void onSerialAbort();     /* 中止发送 */
+    void onSerialPreview();   /* 只打包不发，把包结构打到日志 */
+    void onSerialIntervalChanged(int ms);
+    void onSerialModeChanged(int idx);
+    void onSerialHsTimeoutChanged(int ms);
+    void onSerialPacketSent(int ctrl, int pixelCount, quint16 crc, int inFlight);
+    void onSerialProgress(int sent, int total, int rows, int totalRows);
+    void onSerialFinished(bool aborted);
+    void onSerialError(const QString &msg);
+    void onSerialRequestReceived(int seq, int remaining);
+    void onSerialHandshakeTimeout(int waitedMs, int remaining);
 
     /* 内嵌文件浏览面板 */
     void onFbUp();
@@ -80,6 +102,23 @@ private:
     QPushButton    *m_openBtn;
     QPushButton    *m_grayBtn;
     QPlainTextEdit *m_log;
+
+    /* ---- 串口下发 ---- */
+    QComboBox    *m_serPortCombo;
+    QPushButton  *m_serRefreshBtn;
+    QPushButton  *m_serOpenBtn;
+    QComboBox    *m_serModeCombo;      /* 握手 / 自由 */
+    QSpinBox     *m_serHsTimeoutSpin;  /* 握手超时 ms */
+    QSpinBox     *m_serIntervalSpin;   /* 包间隔 ms，限速用 */
+    QPushButton  *m_serSendBtn;
+    QPushButton  *m_serAbortBtn;
+    QPushButton  *m_serPreviewBtn;     /* 仅打包含但不发送 */
+    QProgressBar *m_serBar;
+    QLabel       *m_serInfo;
+    SerialIo     *m_ser;
+    QElapsedTimer m_serClock;
+    int           m_serSentPkts;       /* 已发包数，握手进度显示用 */
+    int           m_serTotalPkts;      /* 本幅图总包数 */
 
     /* 文件浏览面板 */
     bool           m_fbSaveMode;

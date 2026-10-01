@@ -2,6 +2,7 @@
 #include "bsp_delay.h"
 
 int homing(){
+    lease_close();
     uint32_t timeout = 0;
     sys_state = homing_1;
     x.lock = 0;
@@ -92,6 +93,7 @@ int homing(){
 }
 
 int goto_point(int x_point,int y_point){
+    lease_close();
 	int8_t x_dir = 0;
 	int8_t y_dir = 0;
 	uint32_t times = 0;

@@ -583,6 +583,16 @@
               <FileType>5</FileType>
               <FilePath>..\Core\Inc\configure.h</FilePath>
             </File>
+            <File>
+              <FileName>CRC.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\CRC.c</FilePath>
+            </File>
+            <File>
+              <FileName>CRC.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\Inc\CRC.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

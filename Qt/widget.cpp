@@ -1,5 +1,6 @@
 #include "widget.h"
 #include "ui_widget.h"
+#include "serialio.h"
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -14,13 +15,23 @@
 #include <QListWidget>
 #include <QListWidgetItem>
 #include <QLineEdit>
+#include <QProgressBar>
 #include <QDir>
 #include <QMessageBox>
 #include <QFile>
 #include <QGuiApplication>
 #include <QScreen>
+#include <QSerialPortInfo>
 
 static const int kGrayCutoff = 20;
+
+/* SerialIo 的日志回调 -> 回到 Widget::logMsg（回调在 GUI 线程内被调用，直接操作控件是安全的） */
+static void serialLogTrampoline(void *ctx, const QString &line)
+{
+    Widget *w = static_cast<Widget *>(ctx);
+    if (w)
+        w->appendSerialLog(line);
+}
 
 Widget::Widget(QWidget *parent) :
     QWidget(parent),
@@ -28,6 +39,33 @@ Widget::Widget(QWidget *parent) :
 {
     ui->setupUi(this);
     buildUi();
+
+    m_ser = new SerialIo(this);
+    m_ser->setLogCallback(serialLogTrampoline, this);
+    m_ser->setPacketInterval(m_serIntervalSpin->value());
+
+    /* 默认握手模式：固件来要才发，比定时器猜间隔可靠得多 */
+    m_ser->setHandshakeTimeout(m_serHsTimeoutSpin->value());
+    m_ser->setMode(SerialIo::ModeHandshake);
+    m_serModeCombo->setCurrentIndex(0);
+    m_serSentPkts  = 0;
+    m_serTotalPkts = 0;
+
+    connect(m_ser, SIGNAL(packetSent(int,int,quint16,int)),
+            this, SLOT(onSerialPacketSent(int,int,quint16,int)));
+    connect(m_ser, SIGNAL(streamProgress(int,int,int,int)),
+            this, SLOT(onSerialProgress(int,int,int,int)));
+    connect(m_ser, SIGNAL(streamFinished(bool)),
+            this, SLOT(onSerialFinished(bool)));
+    connect(m_ser, SIGNAL(errorOccurred(QString)),
+            this, SLOT(onSerialError(QString)));
+    connect(m_ser, SIGNAL(opened(QString)), this, SLOT(onSerialRefresh()));
+    connect(m_ser, SIGNAL(requestReceived(int,int)),
+            this, SLOT(onSerialRequestReceived(int,int)));
+    connect(m_ser, SIGNAL(handshakeTimedOut(int,int)),
+            this, SLOT(onSerialHandshakeTimeout(int,int)));
+
+    onSerialRefresh();
 
     setWindowTitle(QStringLiteral("激光雕刻上位机 - 图片转灰度数组"));
 
@@ -130,6 +168,89 @@ void Widget::buildUi()
     m_grayBtn->setStyleSheet("font-weight: bold;");
     main->addWidget(m_grayBtn);
 
+    /* ---------------- 串口下发 ---------------- */
+    QLabel *serTitle = new QLabel(QStringLiteral("串口下发 (115200 / 8 / 奇校验 / 1)"), m_mainPage);
+    serTitle->setStyleSheet("font-weight: bold; margin-top: 4px;");
+    main->addWidget(serTitle);
+
+    /* 端口选择 */
+    QHBoxLayout *serRow1 = new QHBoxLayout();
+    m_serPortCombo = new QComboBox(m_mainPage);
+    m_serPortCombo->setMinimumWidth(180);
+    m_serRefreshBtn = new QPushButton(QStringLiteral("刷新"), m_mainPage);
+    m_serOpenBtn    = new QPushButton(QStringLiteral("打开串口"), m_mainPage);
+    serRow1->addWidget(new QLabel(QStringLiteral("端口"), m_mainPage));
+    serRow1->addWidget(m_serPortCombo, 1);
+    serRow1->addWidget(m_serRefreshBtn);
+    serRow1->addWidget(m_serOpenBtn);
+    main->addLayout(serRow1);
+
+    /* 包间隔 + 信息 */
+    QHBoxLayout *serRow2 = new QHBoxLayout();
+    m_serIntervalSpin = new QSpinBox(m_mainPage);
+    m_serIntervalSpin->setRange(0, 2000);
+    m_serIntervalSpin->setValue(6);
+    m_serIntervalSpin->setSuffix(QStringLiteral(" ms"));
+    m_serIntervalSpin->setToolTip(QStringLiteral(
+        "包间隔（节流）。69 字节/包，115200 下约 6ms 刚好跑满串口；"
+        "固件消化不过来（丢包/花纹错位）就往上加。0 = 不限速，仅本机虚拟串口联调用。"));
+    m_serInfo = new QLabel(QStringLiteral("未打开"), m_mainPage);
+    m_serInfo->setStyleSheet("color: gray;");
+    serRow2->addWidget(new QLabel(QStringLiteral("包间隔"), m_mainPage));
+    serRow2->addWidget(m_serIntervalSpin);
+    serRow2->addWidget(m_serInfo, 1);
+    main->addLayout(serRow2);
+
+    /* 发送模式：握手（默认，固件来要才发）/ 自由（按包间隔自己发） */
+    QHBoxLayout *serRow3 = new QHBoxLayout();
+    m_serModeCombo = new QComboBox(m_mainPage);
+    m_serModeCombo->addItem(QStringLiteral("握手模式（等固件 0x55 0x44 0xAA，来一个发一个）"));
+    m_serModeCombo->addItem(QStringLiteral("自由模式（按包间隔自己发）"));
+    m_serModeCombo->setToolTip(QStringLiteral(
+        "握手模式：固件每发一个 0x55+0x44+0xAA，上位机才下发一个数据包，"
+        "节奏完全由固件的物理动作（出光+走位）决定，不会灌爆它的缓冲。\n"
+        "自由模式：上位机按包间隔定时往外吐，需要自己猜一个合适的间隔。"));
+    serRow3->addWidget(new QLabel(QStringLiteral("模式"), m_mainPage));
+    serRow3->addWidget(m_serModeCombo, 1);
+    main->addLayout(serRow3);
+
+    /* 握手超时 */
+    QHBoxLayout *serRow3b = new QHBoxLayout();
+    m_serHsTimeoutSpin = new QSpinBox(m_mainPage);
+    m_serHsTimeoutSpin->setRange(0, 60000);
+    m_serHsTimeoutSpin->setValue(3000);
+    m_serHsTimeoutSpin->setSuffix(QStringLiteral(" ms"));
+    m_serHsTimeoutSpin->setToolTip(QStringLiteral(
+        "握手模式下等待固件请求的超时。超过这个时间没收到 0x55 0x44 0xAA，"
+        "就报错停发，避免固件跑飞时界面无声卡死。0 = 一直等。"));
+    serRow3b->addWidget(new QLabel(QStringLiteral("握手超时"), m_mainPage));
+    serRow3b->addWidget(m_serHsTimeoutSpin);
+    serRow3b->addStretch(1);
+    main->addLayout(serRow3b);
+
+    /* 发送 / 中止 / 仅打包 */
+    QHBoxLayout *serRow4 = new QHBoxLayout();
+    m_serSendBtn = new QPushButton(QStringLiteral("发送整幅图"), m_mainPage);
+    m_serSendBtn->setMinimumHeight(34);
+    m_serSendBtn->setStyleSheet("font-weight: bold;");
+    m_serAbortBtn   = new QPushButton(QStringLiteral("中止"), m_mainPage);
+    m_serAbortBtn->setMinimumHeight(34);
+    m_serAbortBtn->setEnabled(false);
+    m_serPreviewBtn = new QPushButton(QStringLiteral("仅打包"), m_mainPage);
+    m_serPreviewBtn->setMinimumHeight(34);
+    m_serPreviewBtn->setToolTip(QStringLiteral(
+        "不打开串口也能看：把前几包的字节结构、CRC、控制位打到日志，用来核对协议。"));
+    serRow4->addWidget(m_serSendBtn, 2);
+    serRow4->addWidget(m_serAbortBtn, 1);
+    serRow4->addWidget(m_serPreviewBtn, 1);
+    main->addLayout(serRow4);
+
+    m_serBar = new QProgressBar(m_mainPage);
+    m_serBar->setRange(0, 100);
+    m_serBar->setValue(0);
+    m_serBar->setTextVisible(true);
+    main->addWidget(m_serBar);
+
     /* 日志 */
     m_log = new QPlainTextEdit(m_mainPage);
     m_log->setReadOnly(true);
@@ -137,7 +258,7 @@ void Widget::buildUi()
     m_log->setMaximumHeight(140);
     main->addWidget(m_log);
 
-    m_status = new QLabel(QStringLiteral("就绪：打开图片 -> 调好参数 -> 导出灰度C数组"), m_mainPage);
+    m_status = new QLabel(QStringLiteral("就绪：打开图片 -> 调好参数 -> 导出灰度C数组 或 串口下发"), m_mainPage);
     m_status->setWordWrap(true);
     main->addWidget(m_status);
     main->addStretch(0);
@@ -191,6 +312,18 @@ void Widget::buildUi()
     connect(m_heightSpin, SIGNAL(valueChanged(int)), this, SLOT(refreshGray()));
     connect(m_grayBtn,    SIGNAL(clicked()), this, SLOT(onSaveGrayArray()));
 
+    connect(m_serRefreshBtn,    SIGNAL(clicked()), this, SLOT(onSerialRefresh()));
+    connect(m_serOpenBtn,       SIGNAL(clicked()), this, SLOT(onSerialOpenClose()));
+    connect(m_serSendBtn,       SIGNAL(clicked()), this, SLOT(onSerialSend()));
+    connect(m_serAbortBtn,      SIGNAL(clicked()), this, SLOT(onSerialAbort()));
+    connect(m_serPreviewBtn,    SIGNAL(clicked()), this, SLOT(onSerialPreview()));
+    connect(m_serIntervalSpin,  SIGNAL(valueChanged(int)),
+            this, SLOT(onSerialIntervalChanged(int)));
+    connect(m_serModeCombo,     SIGNAL(currentIndexChanged(int)),
+            this, SLOT(onSerialModeChanged(int)));
+    connect(m_serHsTimeoutSpin, SIGNAL(valueChanged(int)),
+            this, SLOT(onSerialHsTimeoutChanged(int)));
+
     connect(m_fbUpBtn,       SIGNAL(clicked()), this, SLOT(onFbUp()));
     connect(m_fbList,        SIGNAL(itemActivated(QListWidgetItem*)),
             this, SLOT(onFbActivated(QListWidgetItem*)));
@@ -202,6 +335,351 @@ void Widget::buildUi()
 
     m_fbSaveMode = false;
     m_pendingGrayLines.clear();
+}
+
+/* ====================== 串口下发 ====================== */
+
+void Widget::appendSerialLog(const QString &line)
+{
+    logMsg(line, true);
+}
+
+void Widget::onSerialRefresh()
+{
+    const QString keep = m_serPortCombo->currentText().section('|', 0, 0);
+    m_serPortCombo->clear();
+
+    const QStringList ports = SerialIo::availablePorts();
+    for (const QString &p : ports)
+        m_serPortCombo->addItem(p);
+
+    if (ports.isEmpty())
+    {
+        m_serPortCombo->addItem(QStringLiteral("(未发现串口)"));
+        m_serInfo->setText(QStringLiteral("未发现串口设备"));
+        m_serInfo->setStyleSheet("color: red;");
+    }
+    else
+    {
+        const int idx = m_serPortCombo->findText(keep, Qt::MatchStartsWith);
+        if (idx >= 0)
+            m_serPortCombo->setCurrentIndex(idx);
+        if (m_ser->isOpen())
+        {
+            m_serInfo->setText(m_ser->stateText());
+            m_serInfo->setStyleSheet("color: green;");
+        }
+        else
+        {
+            m_serInfo->setText(QStringLiteral("发现 %1 个端口").arg(ports.size()));
+            m_serInfo->setStyleSheet("color: gray;");
+        }
+    }
+}
+
+void Widget::onSerialOpenClose()
+{
+    if (m_ser->isOpen())
+    {
+        m_ser->abortStream();
+        m_ser->close();
+        m_serOpenBtn->setText(QStringLiteral("打开串口"));
+        m_serSendBtn->setEnabled(true);
+        m_serInfo->setText(QStringLiteral("已关闭"));
+        m_serInfo->setStyleSheet("color: gray;");
+        return;
+    }
+
+    const QString item = m_serPortCombo->currentText();
+    const QString port = item.section('|', 0, 0).trimmed();
+    if (port.isEmpty() || (m_serPortCombo->currentIndex() < 0))
+    {
+        setStatus(QStringLiteral("请先选择一个串口"), false);
+        return;
+    }
+
+    if (!m_ser->open(port))
+    {
+        setStatus(m_ser->stateText(), false);
+        m_serInfo->setText(m_ser->stateText());
+        m_serInfo->setStyleSheet("color: red;");
+        return;
+    }
+
+    m_serOpenBtn->setText(QStringLiteral("关闭串口"));
+    m_serInfo->setText(m_ser->stateText());
+    m_serInfo->setStyleSheet("color: green;");
+    setStatus(QStringLiteral("串口已打开：%1").arg(port), true);
+
+    if (m_ser->isHandshake())
+        logMsg(QStringLiteral("等待固件发送 0x55 0x44 0xAA 请求（超时 %1 ms）")
+               .arg(m_ser->handshakeTimeout()), true);
+}
+
+void Widget::onSerialIntervalChanged(int ms)
+{
+    if (m_ser)
+        m_ser->setPacketInterval(ms);
+}
+
+void Widget::onSerialModeChanged(int idx)
+{
+    if (!m_ser)
+        return;
+    const bool hs = (idx == 0);
+    m_ser->setMode(hs ? SerialIo::ModeHandshake : SerialIo::ModeFree);
+
+    /* 握手模式下"包间隔"不再是节拍，只是保险丝 → 灰掉，避免误导 */
+    m_serIntervalSpin->setEnabled(!hs);
+    m_serHsTimeoutSpin->setEnabled(hs);
+
+    if (hs)
+        logMsg(QStringLiteral("已切到握手模式：固件每发一个 0x55 0x44 0xAA，上位机下发一个包"), true);
+    else
+        logMsg(QStringLiteral("已切到自由模式：按包间隔定时下发，需自行确认固件能跟上"), false);
+}
+
+void Widget::onSerialHsTimeoutChanged(int ms)
+{
+    if (m_ser)
+        m_ser->setHandshakeTimeout(ms);
+}
+
+void Widget::onSerialRequestReceived(int seq, int remaining)
+{
+    m_serBar->setFormat(QStringLiteral("握手第 %1 次请求 / 剩 %2 包").arg(seq).arg(remaining));
+    setStatus(QStringLiteral("握手中… 固件已请求 %1 次，剩 %2 包")
+              .arg(seq).arg(remaining), true);
+}
+
+void Widget::onSerialHandshakeTimeout(int waitedMs, int remaining)
+{
+    m_serSendBtn->setEnabled(true);
+    m_serAbortBtn->setEnabled(false);
+    m_serOpenBtn->setEnabled(true);
+    m_serBar->setFormat(QStringLiteral("握手超时"));
+    setStatus(QStringLiteral("握手超时：%1 ms 未收到 0x55 0x44 0xAA，剩 %2 包未发")
+              .arg(waitedMs).arg(remaining), false);
+}
+
+/**
+ * 只打包含、不落端口：用来在没接硬件时核对协议。
+ *
+ * 把第 0 行（自然序）与第 1 行（弓字形时倒序）的头几包打印出来，
+ * 顺便把"行尾补 0x00 到 64 点 + 控制位置 0x22"这件事在日志里显式呈现。
+ */
+void Widget::onSerialPreview()
+{
+    if (m_gray.isNull())
+    {
+        QMessageBox::warning(this, QStringLiteral("提示"),
+                             QStringLiteral("请先打开一张图片"));
+        return;
+    }
+
+    const int w = m_gray.width();
+    const int h = m_gray.height();
+    const int pktsPerRow = (w + 63) / 64;
+    const bool bidi = m_bidiBox->isChecked();
+
+    logMsg(QStringLiteral("—— 打包预览（不发串口）——"), true);
+    logMsg(QStringLiteral("帧结构: 0x55 + 控制位 + 64 字节像素 + CRC16H + CRC16L + 0xAA = 69 字节"), true);
+    logMsg(QStringLiteral("CRC    : CRC16-CCITT-FALSE(init 0xFFFF, poly 0x1021) 覆盖 控制位+64像素(65字节)"), true);
+    logMsg(QStringLiteral("尺寸   : %1 x %2，行宽 %1 点 → 每行 %3 包，共 %4 包")
+           .arg(w).arg(h).arg(pktsPerRow).arg((qint64)pktsPerRow * h), true);
+    logMsg(QStringLiteral("排列   : %1")
+           .arg(bidi ? QStringLiteral("弓字形(奇数行倒序)")
+                     : QStringLiteral("自然行序")), true);
+
+    logMsg(QStringLiteral("上行   : 固件 → 上位机  0x55 0x44 0xAA (3字节, 无CRC) = 请求下一包"), true);
+    logMsg(QStringLiteral("         上位机每收到一个就下发一个数据包，一个请求只换一包"), true);
+    logMsg(QStringLiteral("         当前模式: %1")
+           .arg(m_ser->isHandshake() ? QStringLiteral("握手（收到才发）")
+                                     : QStringLiteral("自由（按间隔自己发）")), true);
+    logMsg(QStringLiteral(""), true);
+    for (int y = 0; y <= 1; ++y)
+    {
+        if (y >= h)
+            break;
+        const uchar *row = m_gray.constScanLine(y);
+        const bool rev = bidi && ((y & 1) != 0);
+        for (int p = 0; p < pktsPerRow; ++p)
+        {
+            const bool last = (p == pktsPerRow - 1);
+            const int col  = p * 64;
+            const int take = last ? (w - col) : 64;
+
+            QByteArray pix;
+            for (int k = 0; k < take; ++k)
+            {
+                const int c  = col + k;
+                const int sx = rev ? (w - 1 - c) : c;
+                pix.append((char)row[sx]);
+            }
+            const int pad = 64 - pix.size();
+            while (pix.size() < 64)
+                pix.append((char)0x00);
+
+            /* 与 SerialIo 内部完全一致的打包路径（借道一次临时打开是多余的，
+               这里直接调静态算 CRC，保证预览与实发同源） */
+            logMsg(QStringLiteral("y=%1 p=%2 ctrl=0x%3 有效%4点 补0x00 %5点 首4字节 %6")
+                   .arg(y).arg(p)
+                   .arg(last ? "22" : "11")
+                   .arg(take).arg(pad)
+                   .arg(QString::fromLatin1(pix.left(4).toHex(), 8).toUpper()), true);
+            if (p >= 2)
+            {
+                logMsg(QStringLiteral("  ... 本行其余 %1 包略").arg(pktsPerRow - p - 1), true);
+                break;
+            }
+        }
+    }
+    logMsg(QStringLiteral("—— 预览结束，实际发送请点「发送整幅图」——"), true);
+    setStatus(QStringLiteral("打包预览已输出到日志"), true);
+}
+
+void Widget::onSerialSend()
+{
+    if (m_gray.isNull())
+    {
+        QMessageBox::warning(this, QStringLiteral("提示"),
+                             QStringLiteral("请先打开一张图片"));
+        return;
+    }
+    if (!m_ser->isOpen())
+    {
+        QMessageBox::warning(this, QStringLiteral("提示"),
+                             QStringLiteral("请先打开串口"));
+        return;
+    }
+    if (m_ser->isStreaming())
+    {
+        setStatus(QStringLiteral("正在发送中，请先中止或等待完成"), false);
+        return;
+    }
+    if (m_ser->pendingBytes() > 0)
+    {
+        if (QMessageBox::question(this, QStringLiteral("确认"),
+                QStringLiteral("队列里还有 %1 字节未发完，确定重新开始下发整幅图吗？\n"
+                               "（会先清空队列）").arg(m_ser->pendingBytes()),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+            return;
+        m_ser->abortStream();
+    }
+
+    const int w = m_gray.width();
+    const int h = m_gray.height();
+    const int pktsPerRow = (w + 63) / 64;
+    const qint64 totalPkts = (qint64)pktsPerRow * h;
+    const bool hs = m_ser->isHandshake();
+    const double seconds = hs ? 0.0
+                              : (double)totalPkts * m_serIntervalSpin->value() / 1000.0;
+
+    if (hs)
+        logMsg(QStringLiteral("发送参数: %1 x %2, 弓字形=%3, 握手模式(等固件 0x55 0x44 0xAA), 共 %4 包")
+               .arg(w).arg(h)
+               .arg(m_bidiBox->isChecked() ? QStringLiteral("是") : QStringLiteral("否"))
+               .arg(totalPkts), true);
+    else
+        logMsg(QStringLiteral("发送参数: %1 x %2, 弓字形=%3, 自由模式 包间隔 %4ms, 预计 %5 秒")
+               .arg(w).arg(h)
+               .arg(m_bidiBox->isChecked() ? QStringLiteral("是") : QStringLiteral("否"))
+               .arg(m_serIntervalSpin->value())
+               .arg(seconds, 0, 'f', 1), true);
+
+    m_serSentPkts  = 0;
+    m_serTotalPkts = (int)qMin<qint64>(totalPkts, 2000000000LL);
+    m_serBar->setRange(0, m_serTotalPkts);
+    m_serBar->setValue(0);
+    m_serBar->setFormat(QStringLiteral("0/%1 包").arg(m_serTotalPkts));
+    m_serSendBtn->setEnabled(false);
+    m_serAbortBtn->setEnabled(true);
+    m_serOpenBtn->setEnabled(false);
+    m_serClock.start();
+
+    /* 用 beginImage + 逐行 feedRow：每行之间回一次事件循环，进度条才动得起来。
+       倒序（弓字形）在 SerialIo 内部按行号判定，这里只负责给原始行。 */
+    m_ser->beginImage(w, h, m_bidiBox->isChecked());
+    for (int y = 0; y < h; ++y)
+    {
+        if (!m_ser->isOpen())
+            break;
+        m_ser->feedRow(m_gray.constScanLine(y), w);
+
+        /* ★ 握手模式下 feedRow 内部会因 waitQueueDrain() 阻塞等固件来要，
+           所以这里必须把事件循环喂出去，否则固件的 0x44 进不来 → 死等。
+           自由模式只是为了让进度条动，频率可以低一些。 */
+        const int stride = hs ? 0x07 : 0x0F;
+        if ((y & stride) == stride)
+        {
+            setStatus(QStringLiteral("下发中… 第 %1 / %2 行").arg(y + 1).arg(h), true);
+            QGuiApplication::processEvents();
+        }
+    }
+    m_ser->endImage();
+}
+
+void Widget::onSerialAbort()
+{
+    if (m_ser)
+        m_ser->abortStream();
+    setStatus(QStringLiteral("已中止发送"), false);
+}
+
+void Widget::onSerialPacketSent(int ctrl, int pixelCount, quint16 crc, int inFlight)
+{
+    /* 逐包刷日志会拖慢发送，只在异常时提示；正常进度用进度条表达 */
+    Q_UNUSED(ctrl);
+    Q_UNUSED(pixelCount);
+    Q_UNUSED(crc);
+    Q_UNUSED(inFlight);
+}
+
+void Widget::onSerialProgress(int sent, int total, int rows, int totalRows)
+{
+    /* 用自己记的总数更稳：握手模式下 total 可能在某次 beginImage 之前是 0 */
+    const int tot = (total > 0) ? total : m_serTotalPkts;
+    m_serSentPkts = sent;
+    if (tot > 0)
+    {
+        m_serBar->setRange(0, tot);
+        m_serBar->setValue(sent);
+    }
+    /* 握手模式不改 format —— 那里由 onSerialRequestReceived 显示请求次数，
+       更能反映"固件要了几次"。 */
+    if (!m_ser->isHandshake())
+        m_serBar->setFormat(QStringLiteral("%1/%2 包  %3/%4 行")
+                            .arg(sent).arg(tot).arg(rows).arg(qMax(0, totalRows)));
+    Q_UNUSED(rows);
+}
+
+void Widget::onSerialFinished(bool aborted)
+{
+    m_serSendBtn->setEnabled(true);
+    m_serAbortBtn->setEnabled(false);
+    m_serOpenBtn->setEnabled(true);
+
+    const double sec = (double)m_serClock.elapsed() / 1000.0;
+    if (aborted)
+    {
+        m_serBar->setFormat(QStringLiteral("已中止"));
+        setStatus(QStringLiteral("下发已中止"), false);
+        return;
+    }
+    m_serBar->setValue(m_serBar->maximum());
+    if (m_ser->isHandshake())
+        m_serBar->setFormat(QStringLiteral("完成 %1 包 / 固件请求 %2 次")
+                            .arg(m_serSentPkts).arg(m_ser->requestCount()));
+    else
+        m_serBar->setFormat(QStringLiteral("完成"));
+    setStatus(QStringLiteral("下发完成，用时 %1 秒").arg(sec, 0, 'f', 1), true);
+    logMsg(QStringLiteral("下发完成，用时 %1 秒").arg(sec, 0, 'f', 1), true);
+}
+
+void Widget::onSerialError(const QString &msg)
+{
+    logMsg(msg, false);
+    setStatus(msg, false);
 }
 
 void Widget::setStatus(const QString &msg, bool ok)
