@@ -274,6 +274,7 @@ void TIM2_IRQHandler(void)
           if (x.cur_point >= x.all_point)
           {
             y.lock = 1;
+			work_cusor_flag = 1;
             x.cur_point = 0;
             HAL_GPIO_TogglePin(x_dir_grop, x_dir_pin);
           }

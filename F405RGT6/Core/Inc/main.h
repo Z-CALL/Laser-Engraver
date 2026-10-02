@@ -60,7 +60,7 @@ extern "C" {
 typedef struct conformation{
    uint32_t all_point;
    uint32_t cur_point;
-   uint8_t add_flag;
+   volatile uint8_t add_flag;
    volatile uint8_t lock;
    volatile uint8_t divide_step;
 }conformation;
@@ -99,6 +99,8 @@ typedef enum state{
 	extern uint8_t RX_Ctl[8];
 	extern uint8_t RX_write_cusor;
 	extern uint8_t work_cusor;
+	extern uint8_t work_cusor_point;
+	extern volatile uint8_t work_cusor_flag;
 
 /* USER CODE END EC */
 

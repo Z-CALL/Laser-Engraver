@@ -20,9 +20,48 @@ class QImage;
  *                     合计 69 字节
  *
  * 控制位：
- *     0x11  数据    —— 帧内 64 个像素点，不换行
- *     0x22  换行    —— 帧内 64 个像素点属于**新的一行**（行尾自动补 0x00）
- *     0x33  下发配置 —— 单独一个数据包（本版本未实现）
+ *     0x11  数据    —— 本包是**行内**的一段；画完继续等下一包
+ *     0x22  换行    —— 本包是**这一行的最后一包**；画完这 64 点后 y++、换到下一行
+ *     0x33  下发配置 —— 独立的一次性数据包（格式见下方「配置包格式」）
+ *
+ * ★ 0x22 的确切语义（固件必须按这个实现，否则整幅图会错行）
+ *   标记挂在**行尾包**上，包内的 64 点属于「刚刚结束的这一行」，**不是新的一行**。
+ *   所以固件的动作顺序是：**先画完这 64 点，再 y++**。
+ *
+ *   行宽 128（每行 2 包）时：
+ *     0x11(第0行 px0-63) 0x22(第0行 px64-127) 0x11(第1行 px0-63) 0x22(第1行 px64-127)
+ *
+ *   行宽 64（每行恰好 1 包，即本工程默认配置）退化成最简形式：
+ *     0x22(第0行 px0-63) 0x22(第1行 px0-63) 0x22(第2行 px0-63) ...
+ *     → 每个 0x22 包正好是一整行，固件「画完 y++」即可，不用关心"新行旧行"。
+ *
+ * ======================= 配置包格式（控制位 0x33）=======================
+ * 骨架与数据包**完全相同**（69 字节，CRC 覆盖同一段 65 字节），只是载荷换了内容：
+ *
+ *   偏移  长度  内容
+ *     0     1   0x55           帧头
+ *     1     1   0x33           控制位 = 下发配置
+ *     2     1   0x44           X 字段标签
+ *     3-4   2   X轴一行像素点   （= 图像宽；大端，高字节在前）
+ *     5     1   0x55           Y 字段标签
+ *     6-7   2   Y轴一列像素点   （= 图像高；大端，高字节在前）
+ *     8     1   0x66           速度字段标签
+ *     9     1   加工速度         （1 字节，单位由固件定义）
+ *    10-65  56  0xFF 填充        （预留位，用 0xFF 占满）
+ *    66-67   2  CRC16           （大端）
+ *    68     1   0xAA           帧尾
+ *
+ *   合计 1+1+1+2+1+2+1+1+56+2+1 = 69 ✓
+ *
+ * ★ CRC 范围 = 偏移 1..65 共 65 字节（控制位 + 整个载荷），
+ *   与数据包**同一套算法、同一段范围** → 固件可直接复用同一个校验函数。
+ *
+ * ★ 0x44 / 0x55 / 0x66 是三个**字段标签**（X / Y / 速度各带一个），
+ *   不是数据。注意 0x55 在这里是标签，与帧头的 0x55 含义不同 ——
+ *   解析时必须按**固定偏移**取字段，不要靠扫 0x55 定位。
+ *
+ * ★ 配置包不走握手、不进队列：它是独立的一次性命令，直接写串口。
+ *   图像下发途中会拒发，免得插进像素流里把固件的状态机搞乱。
  *
  * CRC：CRC16-CCITT-FALSE（poly 0x1021, init 0xFFFF, 无反转, 无异或输出），
  *      校验范围 = 控制位 + 64 像素 = 65 字节，发大端（高字节在前）。
@@ -31,8 +70,9 @@ class QImage;
  * **0x22 只是标记，换行本身不会多传一个包。**
  * 64 是 8/4/2/1 的公倍数，只要按"行内连续"填充，行边界必然落在包边界上，
  * 所以「一包 = 一行的某一段」恒成立，换行信息由控制位携带就够，无须额外字节。
- * 若真的给换行再发一个空包，固件反而要把"收到 0x22 → 推进 y"和
- * "收到 0x22 → 这 64 点属于新行"两条语义叠加，容易重影。
+ * 若真的给换行再发一个空包，固件就要把"收到 0x22 → 推进 y"和
+ * "收到 0x22 → 这 64 点属于新行"两条语义叠加，容易重影 —— 所以这里
+ * 只保留**一条**语义：0x22 = 本行到头了。
  *
  * 行宽不是 64 的整数倍时，行尾用 0x00 补齐到整包（0x00 是"完全不出光"，
  * 补在行尾 = 空走一段，不会在纸上留痕）。
@@ -90,10 +130,11 @@ class SerialIo : public QObject
 public:
     /* 控制位 */
     enum Ctrl {
-        CtrlData = 0x11,    /* 数据 */
-        CtrlNewline = 0x22, /* 换行（帧内 64 点属于新行） */
-        CtrlConfig = 0x33,  /* 下发配置（预留，未实现） */
-        CtrlReqNext = 0x44  /* 上行：固件请求下一包（只出现在 0x55 0x44 0xAA 里） */
+        CtrlData = 0x11,    /* 下行：数据（行内的一段） */
+        CtrlNewline = 0x22, /* 下行：换行（本包是这一行的最后一包，包内 64 点属本行行尾） */
+        CtrlConfig = 0x33,  /* 下行：下发配置 */
+        CtrlReqData = 0x44, /* 上行：请求下一包像素数据（帧 55 44 AA） */
+        CtrlReqCfg  = 0x55  /* 上行：请求下发配置（帧 55 55 AA） */
     };
 
     /* 校验位（对应界面下拉框，避免在头文件里引入 QSerialPort） */
@@ -140,8 +181,22 @@ public:
        否则补发一个全 0x00 的 0x22 空包（让固件立即推进 y）。 */
     bool sendNewline();
 
-    /* 下发配置（预留） */
-    bool sendConfig(const QByteArray &cfg);
+    /* ---- 下发配置（控制位 0x33）----
+       两种触发方式：
+         (a) 固件发 0x55 0x55 0xAA 来要 —— 握手模式下的正常路径
+         (b) 界面上点「下发配置」—— 手动发，调试用
+       打包用的是 setConfigValues() 存下来的 X/Y/速度。 */
+    bool sendConfigPacket(int xPixels, int yPixels, int speed);
+
+    /* 配置包的三个字段值（界面改动时同步过来；固件来要时用这组值打包） */
+    void setConfigValues(int xPixels, int yPixels, int speed);
+    int  cfgXPixels() const;
+    int  cfgYPixels() const;
+    int  cfgSpeed() const;
+
+    /* 生成配置包的 64 字节载荷（不含帧头/控制位/CRC/帧尾）。
+       发送与「仅打包」预览共用，保证两处字节完全一致。静态，便于预览复用。 */
+    static QByteArray buildConfigPayload(int xPixels, int yPixels, int speed);
 
     /* ---- 流式推送 ---- */
     /* 开一幅图：记录尺寸/行号，弓字形倒序在这里生效 */
@@ -168,8 +223,15 @@ public:
     Mode mode() const;
     bool isHandshake() const;
 
-    /* 握手模式：固件每来一个 0x55 0x44 0xAA 就下发一个数据包 */
-    static QByteArray reqNextFrame();   /* 返回 {0x55,0x44,0xAA}，方便打印/自检 */
+    /* ---- 握手请求帧（固件 → 上位机，均 3 字节，无 CRC）----
+       0x55 0x44 0xAA   请求下一包像素数据 → 上位机回一个数据包（0x11 或 0x22）
+       0x55 0x55 0xAA   请求下发配置     → 上位机回一个配置包（0x33）
+
+       两者都是 0x55 开头、0xAA 结尾，只差中间那个字节，
+       所以解析必须按 **3 字节精确匹配**（见 onReadyRead），
+       不能用"见了 0xAA 就收"的宽松扫描 —— 否则下行包的回显会被误判。 */
+    static QByteArray reqDataFrame();    /* {0x55, 0x44, 0xAA} */
+    static QByteArray reqConfigFrame();  /* {0x55, 0x55, 0xAA} */
 
     /* 握手超时（毫秒）：等待 0x44 超过这个时间没等到就报错停发。
        0 = 不超时（一直等）。默认 3000。 */
@@ -202,6 +264,7 @@ signals:
 
     /* 握手：收到固件请求 / 等待请求超时 */
     void requestReceived(int seq, int remainingPackets);
+    void configRequestReceived(int seq);      /* 收到 0x55 0x55 0xAA */
     void handshakeTimedOut(int waitedMs, int remainingPackets);
     void modeChanged(int mode);
     /* 收到任意上行字节（用于界面显示"我到底听到没有"） */
@@ -226,6 +289,8 @@ private:
     bool pumpOne();
     /* 握手模式收尾（幂等） */
     void finishHandshake(bool aborted);
+    /* 用当前 m_cfg* 值打包一个配置包并直接写串口 */
+    bool writeConfigPacket();
 
     QSerialPort *m_port;
     QTimer      *m_timer;
@@ -241,7 +306,8 @@ private:
     /* 发送模式 */
     Mode         m_mode;
     QByteArray   m_rxBuf;         /* 上行字节累积缓冲（3 字节滑动窗） */
-    int          m_reqCount;      /* 收到的 0x44 请求总数 */
+    int          m_reqCount;      /* 收到的取数据请求(0x44)总数 */
+    int          m_cfgReqCount;   /* 收到的取配置请求(0x55)总数 */
     int          m_hsSent;        /* 握手模式下已下发的包数 */
     int          m_hsTimeoutMs;
     bool         m_finished;      /* 本幅图已完成标记，防重复 emit */
@@ -255,6 +321,11 @@ private:
     int          m_cfgDataBits;
     int          m_cfgParity;
     int          m_cfgStopBits;
+
+    /* 配置包(0x33)的三个字段值 */
+    int          m_cfgX;
+    int          m_cfgY;
+    int          m_cfgSpeed;
 
     /* 图像级状态（beginImage 时重置） */
     int          m_imgW;

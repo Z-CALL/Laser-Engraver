@@ -6,6 +6,7 @@
 #include <QImage>
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QVector>
 
 /* ============================ 帧结构常量 ============================ */
 static const quint8  kHead      = 0x55;   /* 帧头 */
@@ -63,6 +64,7 @@ SerialIo::SerialIo(QObject *parent) :
     m_sentPkts(0),
     m_mode(ModeHandshake),
     m_reqCount(0),
+    m_cfgReqCount(0),
     m_hsSent(0),
     m_hsTimeoutMs(kDefaultHsTimeoutMs),
     m_finished(false),
@@ -74,6 +76,9 @@ SerialIo::SerialIo(QObject *parent) :
     m_cfgDataBits(8),
     m_cfgParity(ParityNone),     /* 无校验 8N1：与固件实测一致（原按需求配的奇校验是错的） */
     m_cfgStopBits(0),
+    m_cfgX(64),
+    m_cfgY(64),
+    m_cfgSpeed(100),
     m_imgW(0),
     m_imgH(0),
     m_bidi(false),
@@ -231,6 +236,7 @@ bool SerialIo::open(const QString &portName)
     m_sentPkts   = 0;
     m_sentRows   = 0;
     m_reqCount   = 0;
+    m_cfgReqCount = 0;
     m_hsSent     = 0;
     m_finished   = false;
     m_rxTotal    = 0;
@@ -259,6 +265,7 @@ void SerialIo::close()
     m_rxBuf.clear();
     m_inFlight = 0;
     m_reqCount = 0;
+    m_cfgReqCount = 0;
     m_hsSent   = 0;
     m_finished = false;
     m_state    = QStringLiteral("未打开");
@@ -378,12 +385,137 @@ bool SerialIo::sendNewline()
     return true;
 }
 
-bool SerialIo::sendConfig(const QByteArray &cfg)
+/* ============================ 配置包（0x33）============================ */
+
+/* 配置包载荷里的三个字段标签与填充字节 */
+static const quint8 kCfgTagX    = 0x44;   /* X 轴字段标签 */
+static const quint8 kCfgTagY    = 0x55;   /* Y 轴字段标签 */
+static const quint8 kCfgTagSpd  = 0x66;   /* 加工速度字段标签 */
+static const quint8 kCfgFill    = 0xFF;   /* 预留位填充 */
+
+/**
+ * 生成配置包的 64 字节载荷。
+ *
+ * 布局（包内偏移 2..65）：
+ *   0      1   0x44
+ *   1-2    2   X（大端）
+ *   3      1   0x55
+ *   4-5    2   Y（大端）
+ *   6      1   0x66
+ *   7      1   速度
+ *   8-63  56   0xFF
+ *
+ * ★ 大端（高字节在前）是为了和 CRC 的字节序保持一致 —— 全包都是大端，
+ *   固件读 X 就是 (buf[3] << 8) | buf[4]，不用为不同字段记两套顺序。
+ *   若固件按小端读，把这里两个 append 的顺序对调即可。
+ */
+QByteArray SerialIo::buildConfigPayload(int xPixels, int yPixels, int speed)
 {
-    /* 控制位 0x33：单独一个数据包，本版本按需求暂不实现 */
-    Q_UNUSED(cfg);
-    emitLog(QStringLiteral("[!] 控制位 0x33（下发配置）暂未实现，已忽略"));
-    return false;
+    if (xPixels < 0)     { xPixels = 0; }
+    if (xPixels > 0xFFFF){ xPixels = 0xFFFF; }
+    if (yPixels < 0)     { yPixels = 0; }
+    if (yPixels > 0xFFFF){ yPixels = 0xFFFF; }
+    if (speed   < 0)     { speed = 0; }
+    if (speed   > 0xFF)  { speed = 0xFF; }
+
+    QByteArray p;
+    p.reserve(kPixPerPkt);
+
+    p.append((char)kCfgTagX);
+    p.append((char)((xPixels >> 8) & 0xFF));      /* X 高字节 */
+    p.append((char)(xPixels & 0xFF));             /* X 低字节 */
+
+    p.append((char)kCfgTagY);
+    p.append((char)((yPixels >> 8) & 0xFF));      /* Y 高字节 */
+    p.append((char)(yPixels & 0xFF));             /* Y 低字节 */
+
+    p.append((char)kCfgTagSpd);
+    p.append((char)(speed & 0xFF));
+
+    while (p.size() < kPixPerPkt)                 /* 补齐到 64 字节 */
+        p.append((char)kCfgFill);
+
+    return p;
+}
+
+void SerialIo::setConfigValues(int xPixels, int yPixels, int speed)
+{
+    m_cfgX     = xPixels;
+    m_cfgY     = yPixels;
+    m_cfgSpeed = speed;
+}
+
+int SerialIo::cfgXPixels() const { return m_cfgX; }
+int SerialIo::cfgYPixels() const { return m_cfgY; }
+int SerialIo::cfgSpeed()   const { return m_cfgSpeed; }
+
+/**
+ * 用当前 m_cfg* 值打包一个配置包并**直接写串口**。
+ *
+ * ★ 不走 m_queue：配置包是单个独立包，塞进队列反而要额外处理"它在像素流里的位置"。
+ *   直接写会排在**已经缓冲出去的字节之后**，语义上就是"紧接着发一个配置包"。
+ */
+bool SerialIo::writeConfigPacket()
+{
+    if (!m_port->isOpen())
+    {
+        emit errorOccurred(QStringLiteral("串口未打开，无法下发配置"));
+        return false;
+    }
+
+    const QByteArray payload = buildConfigPayload(m_cfgX, m_cfgY, m_cfgSpeed);
+    const QByteArray pkt     = buildPacket((quint8)CtrlConfig, payload);
+
+    const qint64 n = m_port->write(pkt);
+    if (n <= 0)
+    {
+        emit errorOccurred(QStringLiteral("配置包写入失败：%1").arg(m_port->errorString()));
+        return false;
+    }
+    m_inFlight += n;
+
+    const quint16 crc = (quint16)(((quint8)pkt.at(66) << 8) | (quint8)pkt.at(67));
+
+    /* 把整包 hex 打出来：配置错了整幅图都会错位，值得让它可核对 */
+    QString hex;
+    for (int i = 0; i < pkt.size(); ++i)
+    {
+        if (i && (i % 16 == 0))
+            hex += QStringLiteral(" ");
+        hex += QStringLiteral("%1 ").arg((quint8)pkt.at(i), 2, 16, QChar('0')).toUpper();
+    }
+
+    emitLog(QStringLiteral("[>] 配置包已下发：X=%1 Y=%2 速度=%3，CRC=0x%4")
+            .arg(m_cfgX).arg(m_cfgY).arg(m_cfgSpeed)
+            .arg(crc, 4, 16, QChar('0')).toUpper());
+    emit packetSent((int)CtrlConfig, kPixPerPkt, crc, pendingBytes());
+    emitLog(QStringLiteral("[>] 69 字节：%1").arg(hex.trimmed()));
+    return true;
+}
+
+/**
+ * 下发配置包（界面按钮走这里）。
+ *
+ * ★ 图像正在下发时**拒发**：这是保护手动误点。
+ *   而固件主动发 0x55 0x55 0xAA 来要时不拦 —— 那是固件明确要求的，
+ *   它自己知道当前处于什么状态（见 onReadyRead）。
+ */
+bool SerialIo::sendConfigPacket(int xPixels, int yPixels, int speed)
+{
+    if (!m_port->isOpen())
+    {
+        emit errorOccurred(QStringLiteral("串口未打开，无法下发配置"));
+        return false;
+    }
+    if (isStreaming())
+    {
+        emitLog(QStringLiteral("[!] 正在下发图像，配置包已拒绝 —— "
+                               "请等图像发完或先点「中止」再下发配置"));
+        return false;
+    }
+
+    setConfigValues(xPixels, yPixels, speed);
+    return writeConfigPacket();
 }
 
 /* ============================ 流式推送 ============================ */
@@ -435,11 +567,20 @@ bool SerialIo::isHandshake() const
     return (m_mode == ModeHandshake);
 }
 
-QByteArray SerialIo::reqNextFrame()
+QByteArray SerialIo::reqDataFrame()
 {
     QByteArray f;
     f.append((char)0x55);
-    f.append((char)CtrlReqNext);
+    f.append((char)CtrlReqData);
+    f.append((char)0xAA);
+    return f;
+}
+
+QByteArray SerialIo::reqConfigFrame()
+{
+    QByteArray f;
+    f.append((char)0x55);
+    f.append((char)CtrlReqCfg);
     f.append((char)0xAA);
     return f;
 }
@@ -479,7 +620,7 @@ void SerialIo::onHandshakeTimeout()
         return;                       /* 发完了，不是超时 */
 
     const int left = m_queue.size();
-    emitLog(QStringLiteral("[!] 握手超时：%1 ms 没收到 0x55 0x44 0xAA，剩 %2 包未发")
+    emitLog(QStringLiteral("[!] 握手超时：%1 ms 没收到 0x55 0x44 0xAA（取数据），剩 %2 包未发")
             .arg(m_hsTimeoutMs).arg(left));
     m_timer->stop();
     emit handshakeTimedOut(m_hsTimeoutMs, left);
@@ -507,29 +648,51 @@ void SerialIo::onReadyRead()
     m_rxTotal += chunk.size();
     emit rxActivity(m_rxTotal);
 
-    /* ---- 1. 原样打一份 hex ----
+    /* ---- 1. 把本次收到的字节并进缓冲 ----
        这是"上位机到底听没听到"的唯一直接证据。
        没有它，用户只能猜：是字节根本没到？还是到了但不匹配？
        两者原因完全不同（前者查接线/端口/波特率，后者查帧格式/校验位）。 */
     m_rxBuf.append(chunk);
 
-    int hit = 0;
+    /* ---- 2. 按 3 字节滑动窗找出所有请求帧，并**记住先后顺序** ----
+       两种请求都是 0x55 开头 0xAA 结尾，只差中间字节，所以必须精确匹配 3 字节。
+
+       ★ 顺序要保留：不能"先把所有 0x44 处理完再处理 0x55" ——
+         固件若连着发「取数据 + 取配置」，颠倒顺序会让它收到错的回应。 */
+    QVector<quint8> tokens;          /* 值 = CtrlReqData(0x44) 或 CtrlReqCfg(0x55) */
+
     while (true)
     {
-        const int i = m_rxBuf.indexOf(reqNextFrame());
+        const int iData = m_rxBuf.indexOf(reqDataFrame());
+        const int iCfg  = m_rxBuf.indexOf(reqConfigFrame());
+
+        int    i     = -1;
+        quint8 which = 0;
+
+        if ((iData >= 0) && ((iCfg < 0) || (iData < iCfg)))
+        {
+            i = iData;  which = (quint8)CtrlReqData;
+        }
+        else if (iCfg >= 0)
+        {
+            i = iCfg;   which = (quint8)CtrlReqCfg;
+        }
+
         if (i < 0)
             break;
-        ++hit;
-        /* 从匹配处之后继续找；同一批数据里可以塞多个请求 */
+
+        tokens.append(which);
         m_rxBuf.remove(0, i + 3);
     }
+
+    const int hit = tokens.size();
 
     /* 防膨胀：缓冲里剩下的最多只有可能是帧的前缀（<3 字节），
        超过 3 字节说明收到的是垃圾/下行回显，直接丢掉。 */
     if (m_rxBuf.size() > 2)
         m_rxBuf = m_rxBuf.right(2);
 
-    /* ---- 2. 收到的字节上日志（限流，防止垃圾流刷爆窗口） ---- */
+    /* ---- 3. 收到的字节上日志（限流，防止垃圾流刷爆窗口） ---- */
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     const bool   mayLog = (now - m_lastRxLogMs) > 500;
 
@@ -546,13 +709,18 @@ void SerialIo::onReadyRead()
                 hex += QString("%1 ").arg((quint8)chunk.at(i), 2, 16, QChar('0')).toUpper();
             if (chunk.size() > n)
                 hex += QStringLiteral("...");
-            emitLog(QStringLiteral("[!] 收到 %1 字节但不是请求帧 0x55 0x44 0xAA：%2")
+            emitLog(QStringLiteral("[!] 收到 %1 字节但不是请求帧"
+                                   "（期望 0x55 0x44 0xAA 或 0x55 0x55 0xAA）：%2")
                     .arg(chunk.size()).arg(hex.trimmed()));
         }
         return;
     }
 
     {
+        int nData = 0, nCfg = 0;
+        for (int i = 0; i < tokens.size(); ++i)
+            (tokens.at(i) == (quint8)CtrlReqCfg) ? ++nCfg : ++nData;
+
         m_lastRxLogMs = now;
         QString hex;
         const int n = qMin(chunk.size(), 12);
@@ -560,8 +728,10 @@ void SerialIo::onReadyRead()
             hex += QString("%1 ").arg((quint8)chunk.at(i), 2, 16, QChar('0')).toUpper();
         if (chunk.size() > n)
             hex += QStringLiteral("...");
-        emitLog(QStringLiteral("[>] 收到 %1 个请求帧 0x55 0x44 0xAA（本次 %2 字节：%3）")
-                .arg(hit).arg(chunk.size()).arg(hex.trimmed()));
+        emitLog(QStringLiteral("[>] 收到 %1 个请求（取数据 %2 / 取配置 %3）"
+                               "本次 %4 字节：%5")
+                .arg(hit).arg(nData).arg(nCfg)
+                .arg(chunk.size()).arg(hex.trimmed()));
     }
 
     if (m_mode != ModeHandshake)
@@ -572,6 +742,23 @@ void SerialIo::onReadyRead()
 
     for (int k = 0; k < hit; ++k)
     {
+        /* ---- 取配置：固件发 0x55 0x55 0xAA ---- */
+        if (tokens.at(k) == (quint8)CtrlReqCfg)
+        {
+            ++m_cfgReqCount;
+            /* ★ 不设 m_firstReqSeen：那个标志专指"固件要过像素数据"，
+               用来决定握手超时表何时起，不能被配置请求误触发。
+               （否则固件只要过配置、一直不要图，就会误报"握手超时"。） */
+            emitLog(QStringLiteral("[>] 固件请求配置 #%1 → 下发 0x33 配置包"
+                                   "（X=%2 Y=%3 速度=%4）")
+                    .arg(m_cfgReqCount).arg(m_cfgX).arg(m_cfgY).arg(m_cfgSpeed));
+            emit configRequestReceived(m_cfgReqCount);
+            /* 固件主动要的，此时不拦（哪怕是下发途中）—— 它自己知道在干什么 */
+            writeConfigPacket();
+            continue;
+        }
+
+        /* ---- 取数据：固件发 0x55 0x44 0xAA ---- */
         ++m_reqCount;
         m_firstReqSeen = true;
 
@@ -599,15 +786,20 @@ void SerialIo::onReadyRead()
         emit requestReceived(m_reqCount, m_queue.size());
     }
 
-    /* 刚发完一包，给固件留出消化时间；哨兵等它下次来要 */
-    if (!m_queue.isEmpty() || (m_inFlight > 0))
+    /* 刚发完一包，给固件留出消化时间；哨兵等它下次来要。
+       ★ 只在**队列里还有像素包**时才起表：
+         队列空了就没什么可等的了（最后一个包在路上由 onBytesWritten 收尾）。
+         这样"固件只来要配置、一直不要图"的场景不会被误判成握手超时。 */
+    if (!m_queue.isEmpty())
     {
         if (m_hsTimeoutMs > 0)
             m_hsTimer->start(m_hsTimeoutMs);
     }
     else
     {
-        finishHandshake(false);
+        m_hsTimer->stop();
+        if (m_inFlight <= 0)
+            finishHandshake(false);
     }
 }
 
@@ -797,6 +989,8 @@ void SerialIo::beginImage(int width, int height, bool bidi)
     const int pktsPerRow = (width + kPixPerPkt - 1) / kPixPerPkt;
     m_totalPkts = pktsPerRow * height;
 
+    /* 注意：m_cfgReqCount 不在这里重置 —— 配置交换是按"会话"计的，
+       不属于某一幅图，重置了反而看不出"这台设备一共要过几次配置"。 */
     m_reqCount = 0;
     m_hsSent   = 0;
     m_finished = false;

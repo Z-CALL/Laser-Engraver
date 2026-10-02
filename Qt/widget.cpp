@@ -43,6 +43,11 @@ Widget::Widget(QWidget *parent) :
     m_ser = new SerialIo(this);
     m_ser->setLogCallback(serialLogTrampoline, this);
     m_ser->setPacketInterval(m_serIntervalSpin->value());
+    /* 把界面上配置包的初值同步过去 —— 固件来要配置时 SerialIo 自己打包，
+       所以它一开始就得有正确的 X/Y/速度 */
+    m_ser->setConfigValues(m_cfgXSpin->value(),
+                           m_cfgYSpin->value(),
+                           m_cfgSpeedSpin->value());
 
     /* 默认握手模式：固件来要才发，比定时器猜间隔可靠得多 */
     m_ser->setHandshakeTimeout(m_serHsTimeoutSpin->value());
@@ -67,6 +72,8 @@ Widget::Widget(QWidget *parent) :
             this, SLOT(onSerialHandshakeTimeout(int,int)));
     connect(m_ser, SIGNAL(rxActivity(qint64)),
             this, SLOT(onSerialRxActivity(qint64)));
+    connect(m_ser, SIGNAL(configRequestReceived(int)),
+            this, SLOT(onSerialConfigRequest(int)));
 
     onSerialRefresh();
 
@@ -287,6 +294,40 @@ void Widget::buildUi()
     serRow4->addWidget(m_serPreviewBtn, 1);
     main->addLayout(serRow4);
 
+    /* ---- 下发配置（控制位 0x33）：X / Y / 速度 ---- */
+    QHBoxLayout *cfgRow = new QHBoxLayout();
+    m_cfgXSpin = new QSpinBox(m_mainPage);
+    m_cfgXSpin->setRange(0, 65535);
+    m_cfgXSpin->setValue(64);
+    m_cfgXSpin->setToolTip(QStringLiteral("X轴一行像素点数（= 图像宽）。2 字节，大端。"));
+    m_cfgYSpin = new QSpinBox(m_mainPage);
+    m_cfgYSpin->setRange(0, 65535);
+    m_cfgYSpin->setValue(64);
+    m_cfgYSpin->setToolTip(QStringLiteral("Y轴一列像素点数（= 图像高）。2 字节，大端。"));
+    m_cfgSpeedSpin = new QSpinBox(m_mainPage);
+    m_cfgSpeedSpin->setRange(0, 255);
+    m_cfgSpeedSpin->setValue(100);
+    m_cfgSpeedSpin->setToolTip(QStringLiteral(
+        "加工速度。1 字节，0~255，单位由固件定义。"));
+    m_serConfigBtn = new QPushButton(QStringLiteral("下发配置"), m_mainPage);
+    m_serConfigBtn->setMinimumHeight(30);
+    m_serConfigBtn->setToolTip(QStringLiteral(
+        "手动发送 0x33 配置包（69 字节）—— 调试用。\n\n"
+        "正常流程是固件发 0x55 0x55 0xAA 来要，上位机自动回一个配置包；\n"
+        "这个按钮让你不用固件配合也能主动发一个。\n\n"
+        "独立命令：不进队列、不受握手门控。\n"
+        "图像下发途中会被拒绝，避免插进像素流里。\n"
+        "X / Y 会在载入图片后自动填成图像尺寸。"));
+
+    cfgRow->addWidget(new QLabel(QStringLiteral("配置 X"), m_mainPage));
+    cfgRow->addWidget(m_cfgXSpin);
+    cfgRow->addWidget(new QLabel(QStringLiteral("Y"), m_mainPage));
+    cfgRow->addWidget(m_cfgYSpin);
+    cfgRow->addWidget(new QLabel(QStringLiteral("速度"), m_mainPage));
+    cfgRow->addWidget(m_cfgSpeedSpin);
+    cfgRow->addWidget(m_serConfigBtn);
+    main->addLayout(cfgRow);
+
     m_serBar = new QProgressBar(m_mainPage);
     m_serBar->setRange(0, 100);
     m_serBar->setValue(0);
@@ -359,6 +400,10 @@ void Widget::buildUi()
     connect(m_serSendBtn,       SIGNAL(clicked()), this, SLOT(onSerialSend()));
     connect(m_serAbortBtn,      SIGNAL(clicked()), this, SLOT(onSerialAbort()));
     connect(m_serPreviewBtn,    SIGNAL(clicked()), this, SLOT(onSerialPreview()));
+    connect(m_serConfigBtn,     SIGNAL(clicked()), this, SLOT(onSerialSendConfig()));
+    connect(m_cfgXSpin,         SIGNAL(valueChanged(int)), this, SLOT(onCfgValueChanged()));
+    connect(m_cfgYSpin,         SIGNAL(valueChanged(int)), this, SLOT(onCfgValueChanged()));
+    connect(m_cfgSpeedSpin,     SIGNAL(valueChanged(int)), this, SLOT(onCfgValueChanged()));
     connect(m_serIntervalSpin,  SIGNAL(valueChanged(int)),
             this, SLOT(onSerialIntervalChanged(int)));
     connect(m_serModeCombo,     SIGNAL(currentIndexChanged(int)),
@@ -468,9 +513,12 @@ void Widget::onSerialOpenClose()
 
     if (m_ser->isHandshake())
     {
-        logMsg(QStringLiteral("握手模式就绪。上位机此时「不会主动发任何数据」，"
-                              "必须由固件发 0x55 0x44 0xAA 才下发一包。"), true);
-        logMsg(QStringLiteral("★ 前提：先点「发送整幅图」把数据装进队列，否则固件来要也没东西可发。"), false);
+        logMsg(QStringLiteral("握手模式就绪。上位机「不会主动发任何数据」，"
+                              "完全由固件发请求来驱动："), true);
+        logMsg(QStringLiteral("  · 0x55 0x44 0xAA → 回一个像素数据包（0x11 / 0x22）"), true);
+        logMsg(QStringLiteral("  · 0x55 0x55 0xAA → 回一个配置包（0x33）"), true);
+        logMsg(QStringLiteral("★ 取像素前先点「发送整幅图」把数据装进队列；"
+                              "配置包不用装载，固件来要就直接回。"), false);
         logMsg(QStringLiteral("（收到的上行字节会打在日志里；若一直没提示，说明字节根本没到）"), true);
     }
 }
@@ -546,10 +594,34 @@ void Widget::onSerialRxActivity(qint64 totalBytes)
  */
 void Widget::onSerialPreview()
 {
+    logMsg(QStringLiteral("—— 打包预览（不发串口）——"), true);
+    logMsg(QStringLiteral("帧结构: 0x55 + 控制位 + 64 字节像素 + CRC16H + CRC16L + 0xAA = 69 字节"), true);
+
+    /* 配置包不依赖图片，先单独dump 出来 —— 没接硬件也能逐字节核对 */
+    {
+        const int cx = m_cfgXSpin->value();
+        const int cy = m_cfgYSpin->value();
+        const int cs = m_cfgSpeedSpin->value();
+        const QByteArray cp = SerialIo::buildConfigPayload(cx, cy, cs);
+
+        QString chex;
+        for (int i = 0; i < cp.size(); ++i)
+        {
+            if (i && (i % 16 == 0)) chex += QStringLiteral(" ");
+            chex += QStringLiteral("%1 ").arg((quint8)cp.at(i), 2, 16, QChar('0')).toUpper();
+        }
+        logMsg(QStringLiteral("[配置包 0x33] X=%1(2B大端) Y=%2(2B大端) 速度=%3(1B)，"
+                              "后 56 字节 0xFF 填充")
+               .arg(cx).arg(cy).arg(cs), true);
+        logMsg(QStringLiteral("  载荷 64B: %1").arg(chex.trimmed()), true);
+        logMsg(QStringLiteral("  完整包 = 0x55 0x33 | 上述 64B | CRC16H CRC16L | 0xAA"
+                              "（CRC 覆盖控制位+载荷 = 65 字节，与数据包同算法）"), true);
+    }
+
     if (m_gray.isNull())
     {
-        QMessageBox::warning(this, QStringLiteral("提示"),
-                             QStringLiteral("请先打开一张图片"));
+        setStatus(QStringLiteral("配置包预览已输出；未载入图片，跳过数据包预览"), true);
+        logMsg(QStringLiteral("（未载入图片，跳过数据包预览）"), true);
         return;
     }
 
@@ -558,8 +630,6 @@ void Widget::onSerialPreview()
     const int pktsPerRow = (w + 63) / 64;
     const bool bidi = m_bidiBox->isChecked();
 
-    logMsg(QStringLiteral("—— 打包预览（不发串口）——"), true);
-    logMsg(QStringLiteral("帧结构: 0x55 + 控制位 + 64 字节像素 + CRC16H + CRC16L + 0xAA = 69 字节"), true);
     logMsg(QStringLiteral("CRC    : CRC16-CCITT-FALSE(init 0xFFFF, poly 0x1021) 覆盖 控制位+64像素(65字节)"), true);
     logMsg(QStringLiteral("尺寸   : %1 x %2，行宽 %1 点 → 每行 %3 包，共 %4 包")
            .arg(w).arg(h).arg(pktsPerRow).arg((qint64)pktsPerRow * h), true);
@@ -567,8 +637,10 @@ void Widget::onSerialPreview()
            .arg(bidi ? QStringLiteral("弓字形(奇数行倒序)")
                      : QStringLiteral("自然行序")), true);
 
-    logMsg(QStringLiteral("上行   : 固件 → 上位机  0x55 0x44 0xAA (3字节, 无CRC) = 请求下一包"), true);
-    logMsg(QStringLiteral("         上位机每收到一个就下发一个数据包，一个请求只换一包"), true);
+    logMsg(QStringLiteral("上行   : 固件 → 上位机，两种 3 字节请求帧（无 CRC）："), true);
+    logMsg(QStringLiteral("           0x55 0x44 0xAA → 回一个像素数据包（0x11 或 0x22）"), true);
+    logMsg(QStringLiteral("           0x55 0x55 0xAA → 回一个配置包（0x33）"), true);
+    logMsg(QStringLiteral("         一个请求只换一个包，绝不多发"), true);
     logMsg(QStringLiteral("         当前模式: %1")
            .arg(m_ser->isHandshake() ? QStringLiteral("握手（收到才发）")
                                      : QStringLiteral("自由（按间隔自己发）")), true);
@@ -612,6 +684,67 @@ void Widget::onSerialPreview()
     }
     logMsg(QStringLiteral("—— 预览结束，实际发送请点「发送整幅图」——"), true);
     setStatus(QStringLiteral("打包预览已输出到日志"), true);
+}
+
+/**
+ * 配置的 X/Y/速度 改动 → 同步给 SerialIo。
+ *
+ * 固件发 0x55 0x55 0xAA 来要配置时，SerialIo 是**自己**打包回应的，
+ * 所以它必须随时持有最新的 X/Y/速度 —— 不能只在点按钮时才传。
+ */
+void Widget::onCfgValueChanged()
+{
+    if (m_ser)
+        m_ser->setConfigValues(m_cfgXSpin->value(),
+                               m_cfgYSpin->value(),
+                               m_cfgSpeedSpin->value());
+}
+
+/** 固件发 0x55 0x55 0xAA 来要配置：SerialIo 已经回好了，这里只更新界面状态。 */
+void Widget::onSerialConfigRequest(int seq)
+{
+    setStatus(QStringLiteral("固件请求配置第 %1 次 → 已回 0x33 配置包"
+                             "（X=%2 Y=%3 速度=%4）")
+              .arg(seq).arg(m_cfgXSpin->value())
+              .arg(m_cfgYSpin->value()).arg(m_cfgSpeedSpin->value()), true);
+}
+
+/**
+ * 下发配置包（控制位 0x33）—— 手动按钮。
+ *
+ * 正常流程是**固件发 0x55 0x55 0xAA 来要**；这个按钮是给调试用的，
+ * 不用固件配合也能主动发一个。
+ */
+void Widget::onSerialSendConfig()
+{
+    if (!m_ser->isOpen())
+    {
+        QMessageBox::warning(this, QStringLiteral("提示"),
+                             QStringLiteral("请先打开串口"));
+        return;
+    }
+    if (m_ser->isStreaming())
+    {
+        QMessageBox::warning(this, QStringLiteral("提示"),
+                             QStringLiteral("正在下发图像，请先等它发完或点「中止」，"
+                                            "再下发配置。\n\n"
+                                            "配置包插进像素流中间会让固件的状态机错乱。"));
+        return;
+    }
+
+    const int x = m_cfgXSpin->value();
+    const int y = m_cfgYSpin->value();
+    const int s = m_cfgSpeedSpin->value();
+
+    if (m_ser->sendConfigPacket(x, y, s))
+    {
+        setStatus(QStringLiteral("配置已下发：X=%1 Y=%2 速度=%3（69 字节，CRC 覆盖 65 字节）")
+                  .arg(x).arg(y).arg(s), true);
+    }
+    else
+    {
+        setStatus(QStringLiteral("配置下发失败，详见日志"), false);
+    }
 }
 
 void Widget::onSerialSend()
@@ -849,6 +982,11 @@ void Widget::refreshGray()
 
     m_gray       = data;
     m_previewImg = view;
+
+    /* 配置包的 X/Y 跟着图像尺寸走：X = 一行点数（宽），Y = 一列点数（高）。
+       载入新图后自动同步一次，省得用户手动填、填错导致固件按错的尺寸摆点。 */
+    m_cfgXSpin->setValue(w);
+    m_cfgYSpin->setValue(h);
 
     updatePreview();
     setStatus(QStringLiteral("灰度图已就绪：%1 x %2 点").arg(w).arg(h), true);

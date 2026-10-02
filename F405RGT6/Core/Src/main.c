@@ -60,7 +60,7 @@ volatile state sys_state;
 uint8_t* alarm;
 
 uint8_t ctrl_req[3] = {0x55, 0x44, 0xAA};   			/* 换成你的 3 字节内容 */
-uint8_t  req_pending = 0;                          	/* 1 = 已发出，等 67 字节回包 */
+uint8_t req_pending = 0;                          	/* 1 = 已发出，等 67 字节回包 */
 uint32_t req_sent_ms = 0;
 volatile uint8_t need_send_ctl = 0;   				/* 1 = 该发控制信号了 */
 uint8_t RX_number = 0;
@@ -69,6 +69,7 @@ uint8_t RX_Ctl[8];
 uint8_t RX_write_cusor = 0;
 uint8_t work_cusor = 0;
 uint8_t work_cusor_point = 0;
+volatile uint8_t work_cusor_flag = 0;
 
 
 
@@ -130,40 +131,41 @@ int main(void)
   
   OLED_Init();
   
-//  y.all_point = GRAY_IMG_H;
-//  x.all_point = GRAY_IMG_W;
   
   //test_homing();
   //test_go_to_point();
 //  test_laser_PWM_fre_limit_24V();
 //  test_delay();
 
-    // homing();
-
-  
-  htim2.Init.Period    = RASTER_TIM2_PERIOD;
-  htim2.Init.Prescaler = 0U;
-  (void)HAL_TIM_Base_Init(&htim2);
-  __HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_UPDATE);
-
-  HAL_TIM_Base_Start_IT(&htim2);
-
-	if(BT_Init() != 1){
+	if(BT_Send_Ctrl() != 1){
 		for(int i = 0; i < 8; i++){
-			 memset(RX_data[i], 0, 64);
+			memset(RX_data[i], 0, 64);
 		}
 		char program_error[] = {"BT Try again..."};
 		OLED_ShowString(0, 16, program_error, OLED_FONT_08, 1);
 		OLED_Refresh();
-		if(BT_Init() != 1){
+		if(BT_Send_Ctrl() != 1){
             char program_error[] = {"USART error!!!"};
             OLED_ShowString(0, 32, program_error, OLED_FONT_08, 1);
             OLED_Refresh();
 			while(1);
 		}
 	}
+	(void)BT_Init();
 	work_cusor = 0;
 
+    //homing();
+	
+	  htim2.Init.Period    = RASTER_TIM2_PERIOD;
+	  htim2.Init.Prescaler = 0U;
+	  (void)HAL_TIM_Base_Init(&htim2);
+	  __HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_UPDATE);
+
+	  HAL_TIM_Base_Start_IT(&htim2);
+	
+	sys_state = working;
+	
+	
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -220,7 +222,7 @@ int main(void)
             while(1);
         }
 		work_cusor_point++;
-		if(work_cusor_point == 64){
+		if(work_cusor_point == 64 && work_cusor_flag == 0){
 			work_cusor++;
 			if(work_cusor == 8){
 				work_cusor = 0;
@@ -238,6 +240,15 @@ int main(void)
         free(alarm);
         alarm = NULL;
       }
+	  if(work_cusor_flag){
+		  
+		work_cusor_flag = 0;
+		work_cusor++;
+		if(work_cusor == 8){
+			work_cusor = 0;
+		}
+		work_cusor_point = 0;
+	  }
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */

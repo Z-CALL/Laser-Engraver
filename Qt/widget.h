@@ -50,6 +50,9 @@ private slots:
     void onSerialSend();      /* 按新协议下发整幅图 */
     void onSerialAbort();     /* 中止发送 */
     void onSerialPreview();   /* 只打包不发，把包结构打到日志 */
+    void onSerialSendConfig();/* 下发配置包（控制位 0x33） */
+    void onSerialConfigRequest(int seq); /* 固件发 0x55 0x55 0xAA 来要配置 */
+    void onCfgValueChanged(); /* 配置的 X/Y/速度 改动 → 同步给 SerialIo */
     void onSerialIntervalChanged(int ms);
     void onSerialModeChanged(int idx);
     void onSerialHsTimeoutChanged(int ms);
@@ -118,6 +121,11 @@ private:
     QPushButton  *m_serSendBtn;
     QPushButton  *m_serAbortBtn;
     QPushButton  *m_serPreviewBtn;     /* 仅打包含但不发送 */
+    /* 配置包（控制位 0x33）：X / Y / 加工速度 */
+    QSpinBox     *m_cfgXSpin;
+    QSpinBox     *m_cfgYSpin;
+    QSpinBox     *m_cfgSpeedSpin;
+    QPushButton  *m_serConfigBtn;
     QProgressBar *m_serBar;
     QLabel       *m_serInfo;
     SerialIo     *m_ser;
