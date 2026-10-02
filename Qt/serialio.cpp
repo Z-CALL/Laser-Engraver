@@ -17,8 +17,8 @@ static const int     kPktBytes  = 69;     /* 1 + 1 + 64 + 2 + 1 = 69 */
 static const qint64  kHighWater = 128 * 1024;
 static const qint64  kLowWater  =  16 * 1024;
 
-/* 默认 6 ms/包 ≈ 69 字节 / 115200bps(奇校验 11.5 bit/字节) ≈ 6.9ms 线时，
-   6ms 基本把串口跑满而不会在应用层堆积。固件消化不过来就往上调。 */
+/* 默认 6 ms/包 ≈ 69 字节 / 115200bps = 690 bit，8N1 是 10 bit/字节 → 6.0ms 线时。
+   所以 6ms 正好把串口跑满而不会在应用层堆积。固件消化不过来就往上调。 */
 static const int     kDefaultIntervalMs = 6;
 
 /* ============================ CRC ============================ */
@@ -67,6 +67,13 @@ SerialIo::SerialIo(QObject *parent) :
     m_hsTimeoutMs(kDefaultHsTimeoutMs),
     m_finished(false),
     m_lastWriteMs(0),
+    m_rxTotal(0),
+    m_firstReqSeen(false),
+    m_lastRxLogMs(0),
+    m_cfgBaud(115200),
+    m_cfgDataBits(8),
+    m_cfgParity(ParityNone),     /* 无校验 8N1：与固件实测一致（原按需求配的奇校验是错的） */
+    m_cfgStopBits(0),
     m_imgW(0),
     m_imgH(0),
     m_bidi(false),
@@ -83,6 +90,13 @@ SerialIo::SerialIo(QObject *parent) :
     connect(m_hsTimer, SIGNAL(timeout()), this, SLOT(onHandshakeTimeout()));
     connect(m_port, SIGNAL(bytesWritten(qint64)), this, SLOT(onBytesWritten(qint64)));
     connect(m_port, SIGNAL(readyRead()), this, SLOT(onReadyRead()));
+    /* 串口层面的硬错误（校验位错 / 帧错 / 掉线）：
+       这是排查"上位机没反应"的第三条线索 ——
+       前两条是"收到字节了"(rxActivity) 和"字节能凑成请求帧"(onReadyRead)。
+       这里报的是"字节在物理层就被判为坏"，最常见原因就是
+       两端校验位/波特率不一致。用 lambda 免去在头文件里引入 QSerialPort。 */
+    connect(m_port, &QSerialPort::errorOccurred, this,
+            [this](QSerialPort::SerialPortError e) { onPortError((int)e); });
 }
 
 SerialIo::~SerialIo()
@@ -111,6 +125,34 @@ QStringList SerialIo::availablePorts()
 
 /* ============================ 打开 / 关闭 ============================ */
 
+void SerialIo::setPortParams(int baud, int dataBits, int parity, int stopBits)
+{
+    if (baud > 0)
+        m_cfgBaud = baud;
+    if ((dataBits >= 5) && (dataBits <= 8))
+        m_cfgDataBits = dataBits;
+    if ((parity >= ParityNone) && (parity <= ParityEven))
+        m_cfgParity = parity;
+    if ((stopBits >= 0) && (stopBits <= 2))
+        m_cfgStopBits = stopBits;
+}
+
+int SerialIo::cfgBaud() const     { return m_cfgBaud; }
+int SerialIo::cfgDataBits() const { return m_cfgDataBits; }
+int SerialIo::cfgParity() const   { return m_cfgParity; }
+int SerialIo::cfgStopBits() const { return m_cfgStopBits; }
+
+QString SerialIo::cfgText() const
+{
+    const QChar p = (m_cfgParity == ParityOdd)  ? QChar('O')
+                  : (m_cfgParity == ParityEven) ? QChar('E')
+                                                : QChar('N');
+    const QString s = (m_cfgStopBits == 1) ? QStringLiteral("1.5")
+                    : (m_cfgStopBits == 2) ? QStringLiteral("2")
+                                           : QStringLiteral("1");
+    return QString("%1 %2-%3-%4").arg(m_cfgBaud).arg(m_cfgDataBits).arg(p).arg(s);
+}
+
 bool SerialIo::open(const QString &portName)
 {
     close();
@@ -124,7 +166,23 @@ bool SerialIo::open(const QString &portName)
 
     m_port->setPortName(portName);
 
-    /* 115200 / 8 数据位 / 奇校验 / 1 停止位 / 无流控 —— 用户指定，不做自适应 */
+    /* 参数来自 setPortParams()，默认 115200 / 8 / 奇 / 1。
+       ⚠ 校验位必须与固件一致，否则从第 2 个字节起就会错位（见头文件说明）。 */
+    QSerialPort::DataBits db = QSerialPort::Data8;
+    switch (m_cfgDataBits)
+    {
+    case 5: db = QSerialPort::Data5; break;
+    case 6: db = QSerialPort::Data6; break;
+    case 7: db = QSerialPort::Data7; break;
+    default: db = QSerialPort::Data8; break;
+    }
+    QSerialPort::Parity par = QSerialPort::NoParity;
+    if (m_cfgParity == ParityOdd)       par = QSerialPort::OddParity;
+    else if (m_cfgParity == ParityEven) par = QSerialPort::EvenParity;
+    QSerialPort::StopBits sb = QSerialPort::OneStop;
+    if (m_cfgStopBits == 1)      sb = QSerialPort::OneAndHalfStop;
+    else if (m_cfgStopBits == 2) sb = QSerialPort::TwoStop;
+
     if (!m_port->open(QIODevice::ReadWrite))
     {
         m_state = QStringLiteral("打开失败：%1").arg(m_port->errorString());
@@ -132,28 +190,28 @@ bool SerialIo::open(const QString &portName)
         emitLog(QStringLiteral("[!] ") + m_state);
         return false;
     }
-    if (!m_port->setBaudRate(QSerialPort::Baud115200))
+    if (!m_port->setBaudRate(m_cfgBaud))
     {
         m_state = QStringLiteral("设置波特率失败：%1").arg(m_port->errorString());
         m_port->close();
         emit errorOccurred(m_state);
         return false;
     }
-    if (!m_port->setDataBits(QSerialPort::Data8))
+    if (!m_port->setDataBits(db))
     {
         m_state = QStringLiteral("设置数据位失败：%1").arg(m_port->errorString());
         m_port->close();
         emit errorOccurred(m_state);
         return false;
     }
-    if (!m_port->setParity(QSerialPort::OddParity))
+    if (!m_port->setParity(par))
     {
-        m_state = QStringLiteral("设置奇校验失败：%1").arg(m_port->errorString());
+        m_state = QStringLiteral("设置校验位失败：%1").arg(m_port->errorString());
         m_port->close();
         emit errorOccurred(m_state);
         return false;
     }
-    if (!m_port->setStopBits(QSerialPort::OneStop))
+    if (!m_port->setStopBits(sb))
     {
         m_state = QStringLiteral("设置停止位失败：%1").arg(m_port->errorString());
         m_port->close();
@@ -175,11 +233,13 @@ bool SerialIo::open(const QString &portName)
     m_reqCount   = 0;
     m_hsSent     = 0;
     m_finished   = false;
+    m_rxTotal    = 0;
+    m_firstReqSeen = false;
     m_queue.clear();
     m_rxBuf.clear();
     m_hsTimer->stop();
 
-    m_state = QStringLiteral("已打开 %1 (115200 8-O-1)").arg(portName);
+    m_state = QStringLiteral("已打开 %1 (%2)").arg(portName).arg(cfgText());
     emitLog(QStringLiteral("[>] ") + m_state);
     emit opened(portName);
     return true;
@@ -444,6 +504,13 @@ void SerialIo::onReadyRead()
     if (chunk.isEmpty())
         return;
 
+    m_rxTotal += chunk.size();
+    emit rxActivity(m_rxTotal);
+
+    /* ---- 1. 原样打一份 hex ----
+       这是"上位机到底听没听到"的唯一直接证据。
+       没有它，用户只能猜：是字节根本没到？还是到了但不匹配？
+       两者原因完全不同（前者查接线/端口/波特率，后者查帧格式/校验位）。 */
     m_rxBuf.append(chunk);
 
     int hit = 0;
@@ -462,25 +529,66 @@ void SerialIo::onReadyRead()
     if (m_rxBuf.size() > 2)
         m_rxBuf = m_rxBuf.right(2);
 
+    /* ---- 2. 收到的字节上日志（限流，防止垃圾流刷爆窗口） ---- */
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    const bool   mayLog = (now - m_lastRxLogMs) > 500;
+
     if (hit <= 0)
+    {
+        /* ★ 收到东西了、但不是请求帧 —— 这条日志是排查"校验位/波特率不匹配"
+           的第一手证据（那种情况下字节会到，但内容被解错）。 */
+        if (mayLog)
+        {
+            m_lastRxLogMs = now;
+            QString hex;
+            const int n = qMin(chunk.size(), 24);
+            for (int i = 0; i < n; ++i)
+                hex += QString("%1 ").arg((quint8)chunk.at(i), 2, 16, QChar('0')).toUpper();
+            if (chunk.size() > n)
+                hex += QStringLiteral("...");
+            emitLog(QStringLiteral("[!] 收到 %1 字节但不是请求帧 0x55 0x44 0xAA：%2")
+                    .arg(chunk.size()).arg(hex.trimmed()));
+        }
         return;
+    }
+
+    {
+        m_lastRxLogMs = now;
+        QString hex;
+        const int n = qMin(chunk.size(), 12);
+        for (int i = 0; i < n; ++i)
+            hex += QString("%1 ").arg((quint8)chunk.at(i), 2, 16, QChar('0')).toUpper();
+        if (chunk.size() > n)
+            hex += QStringLiteral("...");
+        emitLog(QStringLiteral("[>] 收到 %1 个请求帧 0x55 0x44 0xAA（本次 %2 字节：%3）")
+                .arg(hit).arg(chunk.size()).arg(hex.trimmed()));
+    }
 
     if (m_mode != ModeHandshake)
     {
-        emitLog(QStringLiteral("[!] 收到 %1 个 0x55 0x44 0xAA，但当前是自由模式，已忽略").arg(hit));
+        emitLog(QStringLiteral("[!] 当前是自由模式，请求已忽略（切到握手模式才会响应）"));
         return;
     }
 
     for (int k = 0; k < hit; ++k)
     {
         ++m_reqCount;
+        m_firstReqSeen = true;
 
         if (m_queue.isEmpty())
         {
-            /* 固件要得比图还多：图发完了它还在要。
-               不发空包 —— 发了会让它以为还有数据。只提示。 */
-            emitLog(QStringLiteral("[!] 收到请求 #%1 但队列已空（整幅图已发完），未发送")
-                    .arg(m_reqCount));
+            /* 固件来要，但上位机手里没货。两种可能：
+               (a) 整幅图已发完，固件多要了；
+               (b) 用户根本没点「发送整幅图」，队列从来没装过。
+               都不发空包（发了会让它以为还有数据），但要说清是哪一种 ——
+               这是"没反应"最常见的根因。 */
+            emitLog(QStringLiteral("[!] 收到请求 #%1，但发送队列是空的，未下发任何数据！"
+                                   "%2")
+                    .arg(m_reqCount)
+                    .arg(m_totalPkts == 0
+                         ? QStringLiteral("（原因：还没点「发送整幅图」装载数据 → 请先点它）")
+                         : QStringLiteral("（原因：整幅图已发完，固件多要了 %1 次）")
+                               .arg(m_reqCount - m_sentPkts)));
             emit requestReceived(m_reqCount, 0);
             continue;
         }
@@ -567,6 +675,68 @@ void SerialIo::emitLog(const QString &line)
 }
 
 /**
+ * 串口物理层错误。
+ *
+ * ★ 这个处理器的价值：用户报"固件发了 0x55 0x44 0xAA，上位机没回"时，
+ *   三种可能原因的区分就靠这几条日志：
+ *     · 一条日志都没有，收字节数也是 0  → 字节根本没到（接线/端口选错/固件没发）
+ *     · "收到 N 字节但不是请求帧"        → 字节到了，但内容不对（校验位/波特率错）
+ *     · "校验位错误" (本函数)           → 直接坐实两端校验设置不一致
+ *   没有这些线索，就只能瞎猜。
+ */
+void SerialIo::onPortError(int err)
+{
+    const QSerialPort::SerialPortError e = (QSerialPort::SerialPortError)err;
+    if (e == QSerialPort::NoError)
+        return;
+
+    /* 校验/帧错误会持续刷，限流 */
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    const bool mayLog = (now - m_lastRxLogMs) > 500;
+
+    switch (e)
+    {
+    case QSerialPort::ParityError:
+        if (mayLog)
+        {
+            m_lastRxLogMs = now;
+            emitLog(QStringLiteral("[!] 校验位错误！上位机当前配置是 %1，"
+                                   "固件侧的校验位必须与之一致。"
+                                   "不一致会导致从第 2 个字节起整体错位。")
+                    .arg(cfgText()));
+        }
+        break;
+
+    case QSerialPort::FramingError:
+        if (mayLog)
+        {
+            m_lastRxLogMs = now;
+            emitLog(QStringLiteral("[!] 帧错误：停止位或波特率与固件不一致"
+                                   "（上位机 115200 / 8 / 奇 / 1）。"));
+        }
+        break;
+
+    case QSerialPort::ResourceError:
+        emit errorOccurred(QStringLiteral("串口异常：被拔出或不可用（%1）")
+                           .arg(m_port->errorString()));
+        m_state = QStringLiteral("串口异常掉线");
+        m_timer->stop();
+        m_hsTimer->stop();
+        break;
+
+    case QSerialPort::DeviceNotFoundError:
+    case QSerialPort::PermissionError:
+    case QSerialPort::OpenError:
+        emit errorOccurred(QStringLiteral("串口错误：%1").arg(m_port->errorString()));
+        break;
+
+    default:
+        /* 其余（TimeoutError 等）在双向通信里很常见，不值得刷屏 */
+        break;
+    }
+}
+
+/**
  * 队列降到低水位以下才返回。
  *
  * 为什么需要：整幅图若一次性灌进 QSerialPort，驱动内部缓冲会涨到几百 MB；
@@ -590,8 +760,11 @@ void SerialIo::waitQueueDrain()
         QCoreApplication::processEvents();
     }
 
-    /* 出水后把哨兵续上，等固件下一次来要 */
-    if (hs && !m_aborted && !m_queue.isEmpty() && (m_hsTimeoutMs > 0))
+    /* 出水后把哨兵续上，等固件下一次来要。
+       ★ 必须加 m_firstReqSeen 这个门槛：本函数在 feedRow 里、**第一个请求到来之前**
+       就会被调用（大图灌队列时）。若此时就起表，"用户还在按固件启动键"这几秒
+       会被误判成握手超时。没收到过请求，等待就该是无限的。 */
+    if (hs && m_firstReqSeen && !m_aborted && !m_queue.isEmpty() && (m_hsTimeoutMs > 0))
         m_hsTimer->start(m_hsTimeoutMs);
 }
 
@@ -627,6 +800,7 @@ void SerialIo::beginImage(int width, int height, bool bidi)
     m_reqCount = 0;
     m_hsSent   = 0;
     m_finished = false;
+    m_firstReqSeen = false;
     m_rxBuf.clear();
     m_hsTimer->stop();
 
@@ -709,10 +883,13 @@ void SerialIo::endImage()
 
         if (!m_queue.isEmpty())
         {
-            emitLog(QStringLiteral("[>] 已排入 %1 包 / 预期 %2 包，剩余 %3 包等固件 0x44 来取")
-                    .arg(m_sentPkts).arg(m_totalPkts).arg(m_queue.size()));
-            if (m_hsTimeoutMs > 0)
-                m_hsTimer->start(m_hsTimeoutMs);
+            emitLog(QStringLiteral("[>] 数据已装载 %1 包，现在等固件发 0x55 0x44 0xAA 来取")
+                    .arg(m_queue.size()));
+            emitLog(QStringLiteral("[!] 注意：此时上位机不会主动发任何东西，"
+                                   "固件不发请求就一直等（无超时）"));
+            /* ★ 这里**故意不启动** hsTimer：
+               用户很可能先点了发送、再去按固件那边启动，中间几秒很正常。
+               等第一个请求真的来了（说明固件活着且在说话），再开始掐表。 */
             return;                       /* 不 emit streamFinished，等取完 */
         }
     }

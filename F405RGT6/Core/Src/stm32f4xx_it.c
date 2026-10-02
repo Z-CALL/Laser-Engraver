@@ -59,6 +59,8 @@ static uint32_t step_divide_x2 = STEP_DIVIDE * 6;             //一个脉冲翻�
 extern TIM_HandleTypeDef htim2;
 extern DMA_HandleTypeDef hdma_usart3_rx;
 extern UART_HandleTypeDef huart5;
+extern DMA_HandleTypeDef hdma_usart3_tx;
+
 /* USER CODE BEGIN EV */
 
 /* USER CODE END EV */
@@ -211,17 +213,19 @@ void SysTick_Handler(void)
 void DMA1_Stream1_IRQHandler(void)
 {
   /* USER CODE BEGIN DMA1_Stream1_IRQn 0 */
-  hdma_usart3_rx.XferHalfCpltCallback     = USART3_DMA_HalfCallback;   /* Memory0 过半 */
-  hdma_usart3_rx.XferCpltCallback         = USART3_DMA_FullCallback;   /* Memory0 全满 */
-  hdma_usart3_rx.XferM1HalfCpltCallback   = USART3_DMA_FullCallback;   /* Memory1 过半(即后半段过半) */
-  hdma_usart3_rx.XferM1CpltCallback       = USART3_DMA_HalfCallback;   /* Memory1 全满(回到前半段) */
-  hdma_usart3_rx.XferErrorCallback        = USART3_DMA_ErrorCallback;  /* 传输错误 */
+
   /* USER CODE END DMA1_Stream1_IRQn 0 */
   HAL_DMA_IRQHandler(&hdma_usart3_rx);
   /* USER CODE BEGIN DMA1_Stream1_IRQn 1 */
 
   /* USER CODE END DMA1_Stream1_IRQn 1 */
 }
+
+void DMA1_Stream3_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(&hdma_usart3_tx);
+}
+
 
 /**
   * @brief This function handles TIM2 global interrupt.
@@ -323,6 +327,7 @@ void TIM2_IRQHandler(void)
 
   /* USER CODE END TIM2_IRQn 1 */
 }
+
 
 /**
   * @brief This function handles UART5 global interrupt.

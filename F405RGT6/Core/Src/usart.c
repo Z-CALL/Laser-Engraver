@@ -29,6 +29,7 @@ UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart3;
 UART_HandleTypeDef huart6;
 DMA_HandleTypeDef hdma_usart3_rx;
+DMA_HandleTypeDef hdma_usart3_tx;
 
 /* UART5 init function */
 void MX_UART5_Init(void)
@@ -238,7 +239,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     hdma_usart3_rx.Init.MemInc = DMA_MINC_ENABLE;
     hdma_usart3_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
     hdma_usart3_rx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
-    hdma_usart3_rx.Init.Mode = DMA_CIRCULAR;
+    hdma_usart3_rx.Init.Mode = DMA_NORMAL;
     hdma_usart3_rx.Init.Priority = DMA_PRIORITY_LOW;
     hdma_usart3_rx.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
     if (HAL_DMA_Init(&hdma_usart3_rx) != HAL_OK)
@@ -249,6 +250,30 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     __HAL_LINKDMA(uartHandle,hdmarx,hdma_usart3_rx);
 
   /* USER CODE BEGIN USART3_MspInit 1 */
+
+    /* ---------------- USART3_TX DMA（手工添加）----------------
+       参考 RM0090 表 42（DMA1 请求映射）的 Channel 4 行：
+           Stream0=UART5_RX  Stream1=USART3_RX  Stream2=UART4_RX  Stream3=USART3_TX
+       所以 TX 用 DMA1_Stream3 / CH4，和 RX 占用的 Stream1 不冲突。
+       DMA1 时钟已在 MX_DMA_Init() 里使能。 */
+    hdma_usart3_tx.Instance = DMA1_Stream3;
+    hdma_usart3_tx.Init.Channel             = DMA_CHANNEL_4;
+    hdma_usart3_tx.Init.Direction           = DMA_MEMORY_TO_PERIPH;  /* 注意和 RX 相反 */
+    hdma_usart3_tx.Init.PeriphInc           = DMA_PINC_DISABLE;
+    hdma_usart3_tx.Init.MemInc              = DMA_MINC_ENABLE;
+    hdma_usart3_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_usart3_tx.Init.MemDataAlignment    = DMA_MDATAALIGN_BYTE;
+    hdma_usart3_tx.Init.Mode                = DMA_NORMAL;
+    hdma_usart3_tx.Init.Priority            = DMA_PRIORITY_MEDIUM;
+    hdma_usart3_tx.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_usart3_tx) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    /* 必须 link：HAL_UART_Transmit_DMA() 会直接解引用 huart->hdmatx，
+       没有 NULL 检查，不 link 就是一调用就 HardFault。 */
+    __HAL_LINKDMA(uartHandle, hdmatx, hdma_usart3_tx);
 
   /* USER CODE END USART3_MspInit 1 */
   }
@@ -324,15 +349,7 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
   else if(uartHandle->Instance==USART3)
   {
   /* USER CODE BEGIN USART3_MspDeInit 0 */
-
-  /* USER CODE END USART3_MspDeInit 0 */
-    /* Peripheral clock disable */
     __HAL_RCC_USART3_CLK_DISABLE();
-
-    /**USART3 GPIO Configuration
-    PB10     ------> USART3_TX
-    PB11     ------> USART3_RX
-    */
     HAL_GPIO_DeInit(GPIOB, GPIO_PIN_10|GPIO_PIN_11);
 
     /* USART3 DMA DeInit */
@@ -364,158 +381,81 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
 /* USER CODE BEGIN 1 */
 
 /* ============================================================================
- *  蓝牙串口(USART3) DMA 双缓冲接收 —— 数据通路
+ *  蓝牙串口(USART3) —— 单缓冲 + 主循环手动收 / 手动发
  * ============================================================================
  *
- *  数据流：
- *      蓝牙 -> USART3_DR -> DMA1_Stream1 -> dma_buffer[] -> row_buffer[] -> 激光
- *                              (硬件搬运)      (本文件)        (本文件)      (main.c)
+ *  数据流（收）：
+ *      上位机 -> 蓝牙 -> USART3_DR -> DMA1_Stream1 -> usart3_cmd_buf[] -> 主循环解析
+ *                                       (硬件搬运)       (本文件)          (main.c)
  *
- *  为什么需要两个缓冲区：
- *      上位机是按像素点连续下发灰度值的，速度取决于蓝牙波特率(115200bps),
- *      一旦 USART3 的 RXNE 没有被及时读走就会 Overrun 丢数据。所以让 DMA
- *      全权负责"从串口寄存器搬到 RAM"，CPU 只在搬运告一段落时来做格式整理。
+ *  数据流（发）：
+ *      主循环 -> 任意缓冲区 -> DMA1_Stream3 -> USART3_DR -> 蓝牙 -> 上位机
  *
- *  dma_buffer 被切成前后两半：
- *      +---------------------------+---------------------------+
- *      |   前半段 (4KB)            |   后半段 (4KB)            |
- *      +---------------------------+---------------------------+
- *         ^HT 中断：前半段已收满        ^TC 中断：后半段已收满
+ *  为什么用单缓冲 + 手动轮询，而不是硬件双缓冲：
+ *      双方按"请求/应答"工作 —— 主循环发 3 字节控制信号，上位机回 67 字节。
+ *      DMA 的传输长度就设成一帧的长度(USART3_CMD_BUF_SIZE)，收满即 NDTR==0，
+ *      这本身就是一个确定的帧边界，且背靠背连发也不会粘包；
+ *      总线空闲(IDLE)那条路则用来兼容更短的帧。
+ *      硬件双缓冲的 HT/TC 只在"填满一半 / 填满一整块"时通知 CPU，短包永远凑不满，
+ *      反而收不到；而且双缓冲必须靠中断配合，单缓冲轮询全程不占用中断。
  *
- *      DMA 循环填满前半段 -> 触发 HT 中断 -> DMA 继续去填后半段，
- *      同时 CPU 把前半段搬进 row_buffer。两边各干各的，互不阻塞。
- *
- *  中断处理约定：
- *      中断里【只置标志】，不做 4096 字节的 memcpy —— 长拷贝会拉高中断延迟，
- *      可能让 TIM2 的步进脉冲时序抖动，进而影响雕刻精度。
- *      真正的搬运放在主循环 USART3_DMA_BufferTask() 里做。
+ *  约定：
+ *      USART3_RxStart()  武装一轮接收。收完必须重新调用，否则只收得到一批就停。
+ *      USART3_RxPoll()   主循环里问"这帧好了没"，返回本次收到的字节数（0=还没好）。
+ *      USART3_SendDMA()  异步发出、立即返回；上一包没发完时会被直接丢弃。
  * ==========================================================================*/
 
-/**
-  * @brief  启动 USART3(蓝牙) 的 DMA 接收，把 dma_buffer 交给 DMA 循环填充
-  * @note   必须在 MX_USART3_UART_Init() 之后调用，且只调用一次。
-  * @retval HAL_OK 表示 DMA 已开始搬运
-  */
-HAL_StatusTypeDef USART3_StartReceiveDMA(void)
+uint8_t usart3_cmd_buf[USART3_CMD_BUF_SIZE];
+
+/* 手动武装一轮接收（DMA 目标地址直接就是指令缓冲区） */
+HAL_StatusTypeDef USART3_RxStart(void)
 {
-  HAL_StatusTypeDef status;
+  (void)HAL_DMA_Abort(&hdma_usart3_rx);       /* 复位，NDTR 归位 */
+  hdma_usart3_rx.State = HAL_DMA_STATE_READY;
 
-  dma_event         = 0;
-  half_busy_flag    = 0;
-  dma_rx_block_count = 0;
-  status = HAL_DMAEx_MultiBufferStart_IT(&hdma_usart3_rx,(uint32_t)&USART3->DR,(uint32_t)&dma_buffer[0],(uint32_t)&dma_buffer[ROW_BUFFER_SIZE],ROW_BUFFER_SIZE);
-
-  if (status != HAL_OK)
+  if (HAL_DMA_Start(&hdma_usart3_rx,           /* 纯轮询 → 用不带 IT 的 Start */
+                    (uint32_t)&USART3->DR,
+                    (uint32_t)usart3_cmd_buf,
+                    USART3_CMD_BUF_SIZE) != HAL_OK)
   {
-    return status;
+    return HAL_ERROR;
   }
 
-  huart3.pRxBuffPtr = &dma_buffer[0];
-  huart3.RxXferSize = ROW_BUFFER_SIZE;
-  huart3.RxState    = HAL_UART_STATE_BUSY_RX;
+  __HAL_UART_CLEAR_OREFLAG(&huart3);           /* 不清溢出，重开必崩 */
   ATOMIC_SET_BIT(huart3.Instance->CR3, USART_CR3_DMAR);
-
   return HAL_OK;
 }
 
-/**
-  * @brief  停止 USART3 的 DMA 接收
-  */
 void USART3_StopReceiveDMA(void)
 {
   ATOMIC_CLEAR_BIT(huart3.Instance->CR3, USART_CR3_DMAR);
-  ATOMIC_CLEAR_BIT(huart3.Instance->CR1, USART_CR1_PEIE);
-  ATOMIC_CLEAR_BIT(huart3.Instance->CR3, USART_CR3_EIE);
-
   (void)HAL_DMA_Abort(&hdma_usart3_rx);
-
-  huart3.RxState = HAL_UART_STATE_READY;
 }
 
-/**
-  * @brief  DMA 把 dma_buffer 前半段(4KB)填满了 —— 立即提醒 CPU
-  * @note   由 DMA1_Stream1 中断在本函数上下文中调用，务必保持简短。
-  * @param  hdma DMA 句柄，由 HAL 传入
-  */
-void USART3_DMA_HalfCallback(DMA_HandleTypeDef *hdma)
+/* 主循环里问：这帧收完没有？收完返回字节数，没收完返回 0 */
+uint16_t USART3_RxPoll(void)
 {
-  (void)hdma;
-  /* 告诉主循环：前半段数据齐了，可以搬走了 */
-  dma_event |= DMA_EVENT_HALF;
-  /* DMA 接下来会去写后半段，先打个招呼 */
-  half_busy_flag = 1;
-}
-
-/**
-  * @brief  DMA 把 dma_buffer 后半段(4KB)填满了 —— 立即提醒 CPU
-  * @note   由 DMA1_Stream1 中断在本函数上下文中调用，务必保持简短。
-  * @param  hdma DMA 句柄，由 HAL 传入
-  */
-void USART3_DMA_FullCallback(DMA_HandleTypeDef *hdma)
-{
-  (void)hdma;
-  /* 告诉主循环：后半段数据齐了，可以搬走了 */
-  dma_event |= DMA_EVENT_FULL;
-  dma_rx_block_count++;
-}
-
-/**
-  * @brief  DMA 出错（传输错误 / FIFO 错误 / 直接模式错误）
-  * @param  hdma DMA 句柄，由 HAL 传入
-  */
-void USART3_DMA_ErrorCallback(DMA_HandleTypeDef *hdma)
-{
-  (void)hdma;
-  /* 出错后 DMA 已停，重新拉起来，尽量不丢帧；具体错误码可看 hdma_usart3_rx.ErrorCode */
-  (void)HAL_DMAEx_MultiBufferStart_IT(&hdma_usart3_rx,
-                                      (uint32_t)&USART3->DR,
-                                      (uint32_t)&dma_buffer[0],
-                                      (uint32_t)&dma_buffer[ROW_BUFFER_SIZE],
-                                      ROW_BUFFER_SIZE);
-  ATOMIC_SET_BIT(huart3.Instance->CR3, USART_CR3_DMAR);
-}
-
-/**
-  * @brief  主循环任务：把 DMA 已经收好的数据搬到 row_buffer
-  * @note   请放在 while(1) 里反复调用。它会检查 dma_event，
-  *         只有 DMA 真的搬完一段才做拷贝，平时几乎零开销。
-  */
-void USART3_DMA_BufferTask(void)
-{
-  uint8_t event = dma_event;
-
-  if (event == 0U)
+  if (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_IDLE) != RESET)   /* 总线空闲 = 一帧结束 */
   {
-    return;                     /* 没有新数据，直接返回 */
+    __HAL_UART_CLEAR_IDLEFLAG(&huart3);
+    return (uint16_t)(USART3_CMD_BUF_SIZE - __HAL_DMA_GET_COUNTER(&hdma_usart3_rx));
   }
 
-  /* DMA 硬件双缓冲下，CT 位指示当前 DMA 正在写哪一段。
-     CT == 0 -> 正在写 Memory0(前半段)，说明后半段是安全可读的
-     CT == 1 -> 正在写 Memory1(后半段)，说明前半段是安全可读的 */
-  if ((hdma_usart3_rx.Instance->CR & DMA_SxCR_CT) == 0U)
+  if (__HAL_DMA_GET_COUNTER(&hdma_usart3_rx) == 0U)            /* 写满了也算一帧，防卡死 */
   {
-    /* 后半段安全：搬运后半段 -> row_buffer 的后半部分 */
-    if ((event & DMA_EVENT_FULL) != 0U)
-    {
-      memcpy(&row_buffer[0], &dma_buffer[ROW_BUFFER_SIZE], ROW_BUFFER_SIZE);
-      dma_event &= (uint8_t)(~DMA_EVENT_FULL);
-    }
-  }
-  else
-  {
-    /* 前半段安全：搬运前半段 -> row_buffer 的前半部分 */
-    if ((event & DMA_EVENT_HALF) != 0U)
-    {
-      memcpy(&row_buffer[0], &dma_buffer[0], ROW_BUFFER_SIZE);
-      dma_event &= (uint8_t)(~DMA_EVENT_HALF);
-    }
+    return USART3_CMD_BUF_SIZE;
   }
 
-  /* 两段都处理完了，把"正在被 DMA 写"的标记撤掉 */
-  if (dma_event == 0U)
-  {
-    half_busy_flag = 0;
-  }
+  return 0U;
 }
+
+/* 手动 DMA 发送 */
+void USART3_SendDMA(const uint8_t *buf, uint16_t len)
+{
+  if (huart3.gState != HAL_UART_STATE_READY) { return; }       /* 上一包没发完 */
+  (void)HAL_UART_Transmit_DMA(&huart3, (uint8_t *)buf, len);
+}
+
+
 
 /* USER CODE END 1 */

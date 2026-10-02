@@ -52,17 +52,26 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-uint8_t  row_buffer[ROW_BUFFER_SIZE];
+
 uint32_t read_cusor = 0;
 uint32_t write_cusor = 0;
 conformation x, y;
 volatile state sys_state;
 uint8_t* alarm;
 
-uint8_t dma_buffer[DMA_BUFFER_SIZE];
-volatile uint8_t  dma_event = 0;
-volatile uint8_t  half_busy_flag = 0;
-volatile uint32_t dma_rx_block_count = 0;
+uint8_t ctrl_req[3] = {0x55, 0x44, 0xAA};   			/* 换成你的 3 字节内容 */
+uint8_t  req_pending = 0;                          	/* 1 = 已发出，等 67 字节回包 */
+uint32_t req_sent_ms = 0;
+volatile uint8_t need_send_ctl = 0;   				/* 1 = 该发控制信号了 */
+uint8_t RX_number = 0;
+uint8_t RX_data[8][64] = {0};
+uint8_t RX_Ctl[8];
+uint8_t RX_write_cusor = 0;
+uint8_t work_cusor = 0;
+uint8_t work_cusor_point = 0;
+
+
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -121,21 +130,15 @@ int main(void)
   
   OLED_Init();
   
-  y.all_point = GRAY_IMG_H;
-  x.all_point = GRAY_IMG_W;
+//  y.all_point = GRAY_IMG_H;
+//  x.all_point = GRAY_IMG_W;
   
   //test_homing();
-  if(homing() == 1){
-	char program_error[] = {"Homing success!"};
-	OLED_ShowString(0, 0, program_error, OLED_FONT_08, 1);
-	OLED_Refresh();
-  }else{
-	char program_error[] = {"Homing error!!!"};
-	OLED_ShowString(0, 0, program_error, OLED_FONT_08, 1);
-	OLED_Refresh();
-  }
-  
-  test_go_to_point();
+  //test_go_to_point();
+//  test_laser_PWM_fre_limit_24V();
+//  test_delay();
+
+    // homing();
 
   
   htim2.Init.Period    = RASTER_TIM2_PERIOD;
@@ -145,15 +148,21 @@ int main(void)
 
   HAL_TIM_Base_Start_IT(&htim2);
 
-//  test_laser_PWM_fre_limit_24V();
-//  test_delay();
-  
-
-
-  /* 启动蓝牙串口(USART3)的 DMA 双缓冲接收：
-     DMA 从此开始把上位机下发的像素灰度值循环搬进 dma_buffer，
-     收满前半段/后半段时会在 DMA1_Stream1 中断里置 dma_event 提醒 CPU。*/
- USART3_StartReceiveDMA();
+	if(BT_Init() != 1){
+		for(int i = 0; i < 8; i++){
+			 memset(RX_data[i], 0, 64);
+		}
+		char program_error[] = {"BT Try again..."};
+		OLED_ShowString(0, 16, program_error, OLED_FONT_08, 1);
+		OLED_Refresh();
+		if(BT_Init() != 1){
+            char program_error[] = {"USART error!!!"};
+            OLED_ShowString(0, 32, program_error, OLED_FONT_08, 1);
+            OLED_Refresh();
+			while(1);
+		}
+	}
+	work_cusor = 0;
 
   /* USER CODE END 2 */
 
@@ -162,8 +171,33 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-//      USART3_DMA_BufferTask();
-
+	if(RX_write_cusor != work_cusor && req_pending == 0){
+	  RX_number = 0;
+	  USART3_RxStart();
+      USART3_SendDMA(ctrl_req, 3);
+      req_sent_ms = HAL_GetTick();
+      req_pending = 1;
+	}
+		
+      RX_number = USART3_RxPoll();
+      if(RX_number == USART3_CMD_BUF_SIZE){
+		if(usart3_cmd_buf[0] == 0x55 && usart3_cmd_buf[68] == 0xAA){
+			memcpy(RX_data[RX_write_cusor], usart3_cmd_buf + 2, 64);
+			RX_Ctl[RX_write_cusor] = usart3_cmd_buf[1];
+			RX_write_cusor++;
+			if(RX_write_cusor >= 8){
+			  RX_write_cusor = 0;
+			}
+			req_pending = 0;
+		}
+		USART3_RxStart();
+      }
+      if (req_pending && ((HAL_GetTick() - req_sent_ms) > REPLY_TIMEOUT_MS))
+      {
+          req_pending = 0;
+		  Send_USART_TIMEOUT();
+      }
+	  
       if(y.cur_point >= y.all_point){
         HAL_TIM_Base_Stop_IT(&htim2);
         laser_close();
@@ -177,7 +211,7 @@ int main(void)
         x.add_flag = 0;
         laser_open();
         //set_delay_time(((test_image[y.cur_point][x.cur_point]/25U) + 1) *240);
-        alarm = Creat_alarm(gray_image[y.cur_point][x.cur_point] * 9);
+        alarm = Creat_alarm(RX_data[work_cusor][work_cusor_point] * 9);
         if(alarm == NULL){
             HAL_TIM_Base_Stop_IT(&htim2);
             char program_error[] = {"program error!!!"};
@@ -185,7 +219,16 @@ int main(void)
             OLED_Refresh();
             while(1);
         }
+		work_cusor_point++;
+		if(work_cusor_point == 64){
+			work_cusor++;
+			if(work_cusor == 8){
+				work_cusor = 0;
+			}
+			work_cusor_point = 0;
+		}
       }
+	  
 
       delay_till();
 

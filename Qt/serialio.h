@@ -12,7 +12,7 @@ class QTimer;
 class QImage;
 
 /**
- * 串口下发模块（115200 / 8 数据位 / 奇校验 / 1 停止位）
+ * 串口下发模块（默认 115200 / 8 数据位 / 无校验 / 1 停止位）
  *
  * ============================ 数据包格式 ============================
  *     0x55 | 控制位 | 64 字节像素灰度 | CRC16 高字节 | CRC16 低字节 | 0xAA
@@ -61,6 +61,27 @@ class QImage;
  *
  *   ⚠ 死锁风险：握手下若固件不再发 0x44（跑飞、断线、复位），上位机会一直等。
  *     用 setHandshakeTimeout() 兜底，超时后报错停发，别让界面无声卡住。
+ *     ★ 超时表**只在收到第一个请求之后**才开始计（m_firstReqSeen）——
+ *       否则"点完发送、人还没去按固件启动"这 3 秒就会误报超时。
+ *       等第一个请求之前，等待无限长是正确行为。
+ *
+ *   ⚠ 队列必须**先装载**：握手模式下的数据来源是 m_queue，而 m_queue 只在
+ *     调用 beginImage/feedRow（界面上是「发送整幅图」）时才被填。
+ *     光打开串口不装队列，固件来要也没东西可发 —— 这是最常见的"没反应"原因。
+ *
+ *   ⚠⚠ 校验位必须两端一致！**默认用无校验 8N1**，因为实测固件就是按 8N1 发的。
+ *
+ *     踩过的坑（留档，因为这类错位极难自行看出）：
+ *     最初按需求配了 8O1，而固件实际发 8N1，结果是
+ *     收端把"停止位"当成"校验位"、再把下一帧"起始位"当成"停止位" →
+ *     帧错误 → 重新找下降沿时晚一个 bit 才同步 → **从第 2 个字节起全部错位**。
+ *     实测 0x55 0x44 0xAA 被解成 0x55 0x94 0xFD。
+ *     因为 0x55/0x44/0xAA 的 1 的个数都是偶数，奇校验位恰好=停止位=1，
+ *     所以**第 1 个字节既不错位也不报校验错**，极具迷惑性。
+ *     判据：第 1 字节对、后面全乱 → 几乎一定是校验位/帧格式不匹配。
+ *
+ *     → 用 setPortParams() 可改；界面上有下拉框。
+ *       若哪天要改回奇校验，**MCU 侧必须同步改成奇校验**，否则又是这个现象。
  */
 class SerialIo : public QObject
 {
@@ -74,6 +95,9 @@ public:
         CtrlConfig = 0x33,  /* 下发配置（预留，未实现） */
         CtrlReqNext = 0x44  /* 上行：固件请求下一包（只出现在 0x55 0x44 0xAA 里） */
     };
+
+    /* 校验位（对应界面下拉框，避免在头文件里引入 QSerialPort） */
+    enum Parity { ParityNone = 0, ParityOdd = 1, ParityEven = 2 };
 
     /* 发送模式 */
     enum Mode {
@@ -92,6 +116,15 @@ public:
     /* 打开串口；失败原因通过 errorString() 取 */
     bool open(const QString &portName);
     void close();
+
+    /* 串口参数。默认 = 115200 / 8 数据位 / 无校验 / 1 停止位（与固件实测一致）。
+       必须在 open() 之前调用才会生效；打开后修改请重新打开。 */
+    void setPortParams(int baud, int dataBits, int parity, int stopBits);
+    int  cfgBaud() const;
+    int  cfgDataBits() const;
+    int  cfgParity() const;       /* ParityNone / ParityOdd / ParityEven */
+    int  cfgStopBits() const;     /* 0=1位 1=1.5位 2=2位 */
+    QString cfgText() const;      /* 如 "115200 8-N-1"，用于显示与日志 */
 
     QString portName() const;
     QString errorString() const;
@@ -171,6 +204,8 @@ signals:
     void requestReceived(int seq, int remainingPackets);
     void handshakeTimedOut(int waitedMs, int remainingPackets);
     void modeChanged(int mode);
+    /* 收到任意上行字节（用于界面显示"我到底听到没有"） */
+    void rxActivity(qint64 totalBytes);
 
 private slots:
     void onTimerTick();
@@ -181,6 +216,8 @@ private slots:
 private:
     QByteArray buildPacket(quint8 ctrl, const QByteArray &pixels64) const;
     void emitLog(const QString &line);
+    /* 串口层面的错误（校验位错/帧错/掉线）——诊断"字节到了但解不出来"的关键 */
+    void onPortError(int err);
     /* 队列降到低水位以下才返回，避免一次性把整幅图灌进驱动 */
     void waitQueueDrain();
     /* 真的有包要发、且没有被握手卡住时，才启动定时器 */
@@ -209,6 +246,15 @@ private:
     int          m_hsTimeoutMs;
     bool         m_finished;      /* 本幅图已完成标记，防重复 emit */
     qint64       m_lastWriteMs;   /* 上一次真正写串口的时刻，用于最小间隔保险 */
+    qint64       m_rxTotal;       /* 自打开以来收到的上行字节总数 */
+    bool         m_firstReqSeen;  /* 是否已收到过第一个 0x44 请求（决定超时表何时起） */
+    qint64       m_lastRxLogMs;   /* 上行日志限流，防止垃圾流刷爆日志窗口 */
+
+    /* 串口参数（默认按需求：115200 / 8 / 奇 / 1） */
+    int          m_cfgBaud;
+    int          m_cfgDataBits;
+    int          m_cfgParity;
+    int          m_cfgStopBits;
 
     /* 图像级状态（beginImage 时重置） */
     int          m_imgW;

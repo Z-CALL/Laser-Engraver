@@ -1,8 +1,9 @@
 #include "main.h"
 #include "bsp_delay.h"
+#include "oled.h"
 
-int homing(){
-    lease_close();
+int goto_home(){
+    laser_close();
     uint32_t timeout = 0;
     sys_state = homing_1;
     x.lock = 0;
@@ -92,8 +93,20 @@ int homing(){
     return 1;
 }
 
+void homing(){
+  if(goto_home() == 1){
+	char program_error[] = {"Homing success!"};
+	OLED_ShowString(0, 0, program_error, OLED_FONT_08, 1);
+	OLED_Refresh();
+  }else{
+	char program_error[] = {"Homing error!!!"};
+	OLED_ShowString(0, 0, program_error, OLED_FONT_08, 1);
+	OLED_Refresh();
+  }
+}
+
 int goto_point(int x_point,int y_point){
-    lease_close();
+    laser_close();
 	int8_t x_dir = 0;
 	int8_t y_dir = 0;
 	uint32_t times = 0;

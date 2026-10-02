@@ -51,43 +51,17 @@ void MX_USART6_UART_Init(void);
 
 /* USER CODE BEGIN Prototypes */
 
-/* ---------------- 蓝牙串口(USART3) DMA 双缓冲接收接口 ---------------- */
+#define USART3_CMD_BUF_SIZE  69      /* 一帧 69 字节：DMA 收满 69 即帧边界 */
 
-/**
-  * @brief  启动 USART3(蓝牙) 的 DMA 双缓冲接收
-  * @note   在 MX_USART3_UART_Init() 之后调用一次即可，之后 DMA 会一直循环搬运。
-  * @retval HAL_OK 表示启动成功
-  */
-HAL_StatusTypeDef USART3_StartReceiveDMA(void);
+HAL_StatusTypeDef USART3_RxStart(void);
+void              USART3_StopReceiveDMA(void);
+uint16_t          USART3_RxPoll(void);
+void              USART3_SendDMA(const uint8_t *buf, uint16_t len);
 
-/**
-  * @brief  停止 USART3 的 DMA 接收
-  */
-void USART3_StopReceiveDMA(void);
+extern uint8_t usart3_cmd_buf[USART3_CMD_BUF_SIZE];
 
-/**
-  * @brief  主循环任务：把 DMA 收好的数据搬到 row_buffer
-  * @note   放在 while(1) 里反复调用；无新数据时几乎零开销。
-  */
-void USART3_DMA_BufferTask(void);
+/* USER CODE END Prototypes */
 
-/**
-  * @brief  DMA 收满前半段(4KB)时的提醒（在 DMA1_Stream1 中断里被调用）
-  * @param  hdma DMA 句柄，由 HAL 传入
-  */
-void USART3_DMA_HalfCallback(DMA_HandleTypeDef *hdma);
-
-/**
-  * @brief  DMA 收满后半段(4KB)时的提醒（在 DMA1_Stream1 中断里被调用）
-  * @param  hdma DMA 句柄，由 HAL 传入
-  */
-void USART3_DMA_FullCallback(DMA_HandleTypeDef *hdma);
-
-/**
-  * @brief  DMA 出错回调
-  * @param  hdma DMA 句柄，由 HAL 传入
-  */
-void USART3_DMA_ErrorCallback(DMA_HandleTypeDef *hdma);
 
 /* USER CODE END Prototypes */
 

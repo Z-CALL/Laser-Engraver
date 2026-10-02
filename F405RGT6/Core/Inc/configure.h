@@ -29,6 +29,9 @@
 //定时时间：2625对应32K Hz的中断频率
 extern uint16_t RASTER_TIM2_PERIOD;
 
+//串口接收数据包超时，这里是1S
+#define REPLY_TIMEOUT_MS  1000U
+
 
 
 
@@ -79,6 +82,12 @@ extern uint16_t RASTER_TIM2_PERIOD;
 #define y_limit_u_grop GPIOC
 #define y_limit_u_pin GPIO_PIN_2
 #define y_limit_u_active 1
+
+
+
+/**************************错误码**************************/
+#define BT_INIT_TIMEOUT 0x10				//蓝牙初始化超时
+
 
 
 #endif

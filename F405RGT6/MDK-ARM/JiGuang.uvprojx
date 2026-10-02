@@ -593,6 +593,16 @@
               <FileType>5</FileType>
               <FilePath>..\Core\Inc\CRC.h</FilePath>
             </File>
+            <File>
+              <FileName>Bluetooth.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\Bluetooth.c</FilePath>
+            </File>
+            <File>
+              <FileName>Bluetooth.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\Inc\Bluetooth.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

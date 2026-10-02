@@ -50,6 +50,7 @@ Widget::Widget(QWidget *parent) :
     m_serModeCombo->setCurrentIndex(0);
     m_serSentPkts  = 0;
     m_serTotalPkts = 0;
+    m_serRxBytes   = 0;
 
     connect(m_ser, SIGNAL(packetSent(int,int,quint16,int)),
             this, SLOT(onSerialPacketSent(int,int,quint16,int)));
@@ -64,6 +65,8 @@ Widget::Widget(QWidget *parent) :
             this, SLOT(onSerialRequestReceived(int,int)));
     connect(m_ser, SIGNAL(handshakeTimedOut(int,int)),
             this, SLOT(onSerialHandshakeTimeout(int,int)));
+    connect(m_ser, SIGNAL(rxActivity(qint64)),
+            this, SLOT(onSerialRxActivity(qint64)));
 
     onSerialRefresh();
 
@@ -169,7 +172,7 @@ void Widget::buildUi()
     main->addWidget(m_grayBtn);
 
     /* ---------------- 串口下发 ---------------- */
-    QLabel *serTitle = new QLabel(QStringLiteral("串口下发 (115200 / 8 / 奇校验 / 1)"), m_mainPage);
+    QLabel *serTitle = new QLabel(QStringLiteral("串口下发"), m_mainPage);
     serTitle->setStyleSheet("font-weight: bold; margin-top: 4px;");
     main->addWidget(serTitle);
 
@@ -184,6 +187,45 @@ void Widget::buildUi()
     serRow1->addWidget(m_serRefreshBtn);
     serRow1->addWidget(m_serOpenBtn);
     main->addLayout(serRow1);
+
+    /* 串口参数：波特率 / 数据位 / 校验位 / 停止位
+       ★ 校验位必须和固件一致。不一致时的典型现象是"第 1 个字节对、后面全乱" ——
+       因为收端会把停止位当校验位、把下一帧起始位当停止位，帧错误后晚一个 bit 同步。 */
+    QHBoxLayout *serCfgRow = new QHBoxLayout();
+    m_serBaudCombo = new QComboBox(m_mainPage);
+    m_serBaudCombo->addItems(QStringList()
+        << "9600" << "19200" << "38400" << "57600"
+        << "115200" << "230400" << "460800" << "921600");
+    m_serBaudCombo->setCurrentText("115200");
+
+    m_serDataCombo = new QComboBox(m_mainPage);
+    m_serDataCombo->addItems(QStringList() << "8" << "7" << "6" << "5");
+    m_serDataCombo->setCurrentText("8");
+
+    m_serParityCombo = new QComboBox(m_mainPage);
+    m_serParityCombo->addItem(QStringLiteral("无校验"));   /* 0 */
+    m_serParityCombo->addItem(QStringLiteral("奇校验"));   /* 1 */
+    m_serParityCombo->addItem(QStringLiteral("偶校验"));   /* 2 */
+    m_serParityCombo->setCurrentIndex(0);                  /* 默认无校验（与固件实测一致） */
+    m_serParityCombo->setToolTip(QStringLiteral(
+        "必须与固件一致！实测固件是 8N1（无校验），所以默认选「无校验」。\n\n"
+        "不一致的典型症状：第 1 个字节正确、第 2 个起全是乱码。\n"
+        "原因：收端把停止位当校验位、把下一帧起始位当停止位，帧错误后\n"
+        "晚一个 bit 才重新同步，于是从第 2 字节起整体错位。\n"
+        "（0x55/0x44/0xAA 的 1 的个数都是偶数，奇校验位恰好等于停止位 1，\n"
+        " 所以第 1 字节既不错位也不报校验错，特别有迷惑性。\n"
+        " 实测：8O1 收 8N1 的 55 44 AA → 解成 55 94 FD。）"));
+
+    m_serStopCombo = new QComboBox(m_mainPage);
+    m_serStopCombo->addItems(QStringList() << "1" << "1.5" << "2");
+    m_serStopCombo->setCurrentText("1");
+
+    serCfgRow->addWidget(new QLabel(QStringLiteral("参数"), m_mainPage));
+    serCfgRow->addWidget(m_serBaudCombo, 1);
+    serCfgRow->addWidget(m_serDataCombo);
+    serCfgRow->addWidget(m_serParityCombo);
+    serCfgRow->addWidget(m_serStopCombo);
+    main->addLayout(serCfgRow);
 
     /* 包间隔 + 信息 */
     QHBoxLayout *serRow2 = new QHBoxLayout();
@@ -398,6 +440,19 @@ void Widget::onSerialOpenClose()
         return;
     }
 
+    /* ★ 打开前先把界面上的串口参数写进去。
+       校验位错了会表现成"第 1 字节对、后面全乱"，先在这里落定。 */
+    const int baud     = m_serBaudCombo->currentText().toInt();
+    const int dataBits = m_serDataCombo->currentText().toInt();
+    const int parity   = m_serParityCombo->currentIndex();   /* 0无 1奇 2偶 */
+    const int stopBits = m_serStopCombo->currentIndex();     /* 0=1 1=1.5 2=2 */
+    m_ser->setPortParams(baud, dataBits, parity, stopBits);
+
+    logMsg(QStringLiteral("串口参数：%1").arg(m_ser->cfgText())
+           + (parity == 1 ? QStringLiteral("  （奇校验：固件侧也必须配奇校验）")
+                          : (parity == 0 ? QStringLiteral("  （无校验：固件侧也要 No Parity）")
+                                         : QStringLiteral("  （偶校验）"))), true);
+
     if (!m_ser->open(port))
     {
         setStatus(m_ser->stateText(), false);
@@ -405,15 +460,19 @@ void Widget::onSerialOpenClose()
         m_serInfo->setStyleSheet("color: red;");
         return;
     }
-
     m_serOpenBtn->setText(QStringLiteral("关闭串口"));
-    m_serInfo->setText(m_ser->stateText());
+    m_serInfo->setText(m_ser->stateText() + QStringLiteral("  收 0 字节"));
     m_serInfo->setStyleSheet("color: green;");
     setStatus(QStringLiteral("串口已打开：%1").arg(port), true);
+    m_serRxBytes = 0;
 
     if (m_ser->isHandshake())
-        logMsg(QStringLiteral("等待固件发送 0x55 0x44 0xAA 请求（超时 %1 ms）")
-               .arg(m_ser->handshakeTimeout()), true);
+    {
+        logMsg(QStringLiteral("握手模式就绪。上位机此时「不会主动发任何数据」，"
+                              "必须由固件发 0x55 0x44 0xAA 才下发一包。"), true);
+        logMsg(QStringLiteral("★ 前提：先点「发送整幅图」把数据装进队列，否则固件来要也没东西可发。"), false);
+        logMsg(QStringLiteral("（收到的上行字节会打在日志里；若一直没提示，说明字节根本没到）"), true);
+    }
 }
 
 void Widget::onSerialIntervalChanged(int ms)
@@ -448,8 +507,13 @@ void Widget::onSerialHsTimeoutChanged(int ms)
 void Widget::onSerialRequestReceived(int seq, int remaining)
 {
     m_serBar->setFormat(QStringLiteral("握手第 %1 次请求 / 剩 %2 包").arg(seq).arg(remaining));
-    setStatus(QStringLiteral("握手中… 固件已请求 %1 次，剩 %2 包")
-              .arg(seq).arg(remaining), true);
+    if (remaining > 0)
+        setStatus(QStringLiteral("握手中… 固件已请求 %1 次，已下发，剩 %2 包")
+                  .arg(seq).arg(remaining), true);
+    else
+        setStatus(QStringLiteral("固件第 %1 次请求，但队列已空 —— 未下发。"
+                                 "若是初次使用，请先点「发送整幅图」装载数据")
+                  .arg(seq), false);
 }
 
 void Widget::onSerialHandshakeTimeout(int waitedMs, int remaining)
@@ -458,8 +522,20 @@ void Widget::onSerialHandshakeTimeout(int waitedMs, int remaining)
     m_serAbortBtn->setEnabled(false);
     m_serOpenBtn->setEnabled(true);
     m_serBar->setFormat(QStringLiteral("握手超时"));
-    setStatus(QStringLiteral("握手超时：%1 ms 未收到 0x55 0x44 0xAA，剩 %2 包未发")
+    setStatus(QStringLiteral("握手超时：固件要过包之后就没了动静，%1 ms 没再收到请求，剩 %2 包未发")
               .arg(waitedMs).arg(remaining), false);
+    logMsg(QStringLiteral("[!] 该超时的含义是「固件要过一个包之后就不再来了」。"
+                          "若从头到尾一次请求都没收到，那不是超时，"
+                          "而是字节根本没到 —— 查接线 / 端口 / 波特率 / 校验位。"), false);
+}
+
+/** 每收到上行字节就刷新一次"收 N 字节"，让用户区分"没收到"和"收到了但不匹配"。 */
+void Widget::onSerialRxActivity(qint64 totalBytes)
+{
+    m_serRxBytes = totalBytes;
+    if (m_ser->isOpen())
+        m_serInfo->setText(QStringLiteral("%1  收 %2 字节")
+                           .arg(m_ser->portName()).arg(totalBytes));
 }
 
 /**
@@ -617,6 +693,15 @@ void Widget::onSerialSend()
         }
     }
     m_ser->endImage();
+
+    /* 握手模式：endImage 在"队列还有货"时会提前返回（等固件来取），
+       不会走 onSerialFinished。所以这里要自己把状态摆成"已装载、待命"。 */
+    if (hs && m_ser->isOpen())
+    {
+        setStatus(QStringLiteral("数据已装载 %1 包，待命中 —— 等固件发 0x55 0x44 0xAA，"
+                                 "来一个发一个（固件不说话就一直等，可点中止退出）")
+                  .arg(m_serBar->maximum()), true);
+    }
 }
 
 void Widget::onSerialAbort()

@@ -59,6 +59,7 @@ private slots:
     void onSerialError(const QString &msg);
     void onSerialRequestReceived(int seq, int remaining);
     void onSerialHandshakeTimeout(int waitedMs, int remaining);
+    void onSerialRxActivity(qint64 totalBytes);
 
     /* 内嵌文件浏览面板 */
     void onFbUp();
@@ -107,6 +108,10 @@ private:
     QComboBox    *m_serPortCombo;
     QPushButton  *m_serRefreshBtn;
     QPushButton  *m_serOpenBtn;
+    QComboBox    *m_serBaudCombo;      /* 波特率 */
+    QComboBox    *m_serDataCombo;      /* 数据位 */
+    QComboBox    *m_serParityCombo;    /* 校验位：无/奇/偶 */
+    QComboBox    *m_serStopCombo;      /* 停止位 */
     QComboBox    *m_serModeCombo;      /* 握手 / 自由 */
     QSpinBox     *m_serHsTimeoutSpin;  /* 握手超时 ms */
     QSpinBox     *m_serIntervalSpin;   /* 包间隔 ms，限速用 */
@@ -119,6 +124,7 @@ private:
     QElapsedTimer m_serClock;
     int           m_serSentPkts;       /* 已发包数，握手进度显示用 */
     int           m_serTotalPkts;      /* 本幅图总包数 */
+    qint64        m_serRxBytes;        /* 自打开以来收到的上行字节数 */
 
     /* 文件浏览面板 */
     bool           m_fbSaveMode;
