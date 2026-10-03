@@ -53,9 +53,9 @@ extern uint16_t RASTER_TIM2_PERIOD;
 #define x_dir_grop GPIOA
 #define x_dir_pin GPIO_PIN_8
 #define x_plus_grop GPIOC
-#define x_plus_pin GPIO_PIN_9
+#define x_plus_pin GPIO_PIN_5
 #define x_enable_grop GPIOC
-#define x_enable_pin GPIO_PIN_8
+#define x_enable_pin GPIO_PIN_4
 
 #define y_dir_grop GPIOB
 #define y_dir_pin GPIO_PIN_15
@@ -70,19 +70,24 @@ extern uint16_t RASTER_TIM2_PERIOD;
  *  active分别表示触发限位时限位开关的电平，0 表触发时为低电平，1 表触发时为高电平
  */
 #define x_limit_r_grop GPIOC
-#define x_limit_r_pin GPIO_PIN_0
+#define x_limit_r_pin GPIO_PIN_3
 #define x_limit_r_active 0
 #define x_limit_l_grop GPIOC
-#define x_limit_l_pin GPIO_PIN_1
+#define x_limit_l_pin GPIO_PIN_2
 #define x_limit_l_active 0
 
 #define y_limit_d_grop GPIOC
-#define y_limit_d_pin GPIO_PIN_3
+#define y_limit_d_pin GPIO_PIN_0
 #define y_limit_d_active 1
 #define y_limit_u_grop GPIOC
-#define y_limit_u_pin GPIO_PIN_2
+#define y_limit_u_pin GPIO_PIN_1
 #define y_limit_u_active 1
 
+/*  
+ *  激光引脚的的配置
+ */
+#define Laser_grop GPIOA
+#define Laser_pin GPIO_PIN_15
 
 
 /**************************错误码**************************/
@@ -97,6 +102,8 @@ extern uint16_t RASTER_TIM2_PERIOD;
 #define RX_Ctrl			0x33
 #define TX_Next			0x44
 #define TX_Ctrl			0x55
+#define RX_waiting		0x66
+#define TX_Ready 		0x77
 
 //收到0x33后的信息位
 #define X_ALL_POINT	0x44
@@ -113,7 +120,11 @@ extern uint16_t RASTER_TIM2_PERIOD;
  *  6-7		2		Y 轴一列像素点（大端）
  *  8		1		0x66 速度字段标签
  *  9		1		加工速度
- *  10-65	56		0xFF 填充
+ * 	10		1		0x77 X轴作业原点标签
+ *	11-12	2		X轴作业原点
+ *	13		1		0x88 Y轴作业原点标签
+ *	14-15	2		Y轴作业原点
+ *  16-65	56		0xFF 填充
  *  66-67	2		CRC16（大端）
  *  68		1		0xAA 帧尾
 */

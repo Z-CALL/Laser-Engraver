@@ -17,6 +17,11 @@ void Send_USART_TIMEOUT(){
 	USART3_SendDMA(Next, 3);
 }
 
+void Send_Ready(){
+	static const uint8_t Next[3] = {0x55, TX_Ready, 0xAA};
+	USART3_SendDMA(Next, 3);
+}
+
 int8_t BT_Send_Ctrl(){
 	
 	  RX_number = 0;
@@ -49,11 +54,35 @@ int8_t BT_Send_Ctrl(){
 		  if(usart3_cmd_buf[8] == 0x66){
 			  //先不做处理
 		  }
+		  if(usart3_cmd_buf[10] == 0x77){
+			 x_work_orgin= usart3_cmd_buf[11]<<8|usart3_cmd_buf[12];
+		  }
+		  if(usart3_cmd_buf[13] == 0x88){
+			 y_work_orgin= usart3_cmd_buf[14]<<8|usart3_cmd_buf[15];
+		  }
 		return 1;
 		  
 	  }else{
 		  return -1;
 	  }
+}
+
+void waiting(){
+	while(1){
+	  RX_number = 0;
+	  USART3_RxStart();
+	  Send_Ready();
+      while(RX_number != 3){
+		RX_number = USART3_RxPoll();
+	  }
+	  if(usart3_cmd_buf[0] == 0x55 && usart3_cmd_buf[1] == RX_waiting && usart3_cmd_buf[2] == 0xAA){
+		  memset(usart3_cmd_buf, 0, 64);
+		  (void)BT_Init();
+		  return;
+	  }else{
+		  memset(usart3_cmd_buf, 0, 64);
+	  }
+	}
 }
 
 int8_t BT_Init(){
@@ -70,7 +99,7 @@ int8_t BT_Init(){
 		  
 		RX_number = USART3_RxPoll();
 		  
-		if((HAL_GetTick() - req_sent_ms) > REPLY_TIMEOUT_MS){
+		if((HAL_GetTick() - req_sent_ms) > REPLY_TIMEOUT_MS * 5){
 			USART3_StopReceiveDMA(); 
             char program_error[] = {"BT_RX TIMEOUT!!!"};
             OLED_ShowString(0, 0, program_error, OLED_FONT_08, 1);

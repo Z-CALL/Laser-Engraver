@@ -63,6 +63,8 @@ private slots:
     void onSerialRequestReceived(int seq, int remaining);
     void onSerialHandshakeTimeout(int waitedMs, int remaining);
     void onSerialRxActivity(qint64 totalBytes);
+    void onSerialFirmwareError(int code, const QString &msg);
+    void onSerialFirmwareReady(int count);
 
     /* 内嵌文件浏览面板 */
     void onFbUp();
@@ -121,10 +123,12 @@ private:
     QPushButton  *m_serSendBtn;
     QPushButton  *m_serAbortBtn;
     QPushButton  *m_serPreviewBtn;     /* 仅打包含但不发送 */
-    /* 配置包（控制位 0x33）：X / Y / 加工速度 */
+    /* 配置包（控制位 0x33）：X / Y / 加工速度 / 作业原点 */
     QSpinBox     *m_cfgXSpin;
     QSpinBox     *m_cfgYSpin;
     QSpinBox     *m_cfgSpeedSpin;
+    QSpinBox     *m_cfgXOrgSpin;       /* X 轴作业原点（像素） */
+    QSpinBox     *m_cfgYOrgSpin;       /* Y 轴作业原点（像素） */
     QPushButton  *m_serConfigBtn;
     QProgressBar *m_serBar;
     QLabel       *m_serInfo;

@@ -130,11 +130,15 @@ class SerialIo : public QObject
 public:
     /* 控制位 */
     enum Ctrl {
+        CtrlInitTimeout = 0x10, /* 上行：固件接收超时上报（帧 55 10 AA）
+                                   对应固件的 BT_INIT_TIMEOUT */
         CtrlData = 0x11,    /* 下行：数据（行内的一段） */
         CtrlNewline = 0x22, /* 下行：换行（本包是这一行的最后一包，包内 64 点属本行行尾） */
         CtrlConfig = 0x33,  /* 下行：下发配置 */
         CtrlReqData = 0x44, /* 上行：请求下一包像素数据（帧 55 44 AA） */
-        CtrlReqCfg  = 0x55  /* 上行：请求下发配置（帧 55 55 AA） */
+        CtrlReqCfg  = 0x55, /* 上行：请求下发配置（帧 55 55 AA） */
+        CtrlStart   = 0x66, /* 下行：命令固件开始取数据（帧 55 66 AA） */
+        CtrlReady   = 0x77  /* 上行：固件就绪通知（帧 55 77 AA） */
     };
 
     /* 校验位（对应界面下拉框，避免在头文件里引入 QSerialPort） */
@@ -189,14 +193,18 @@ public:
     bool sendConfigPacket(int xPixels, int yPixels, int speed);
 
     /* 配置包的三个字段值（界面改动时同步过来；固件来要时用这组值打包） */
-    void setConfigValues(int xPixels, int yPixels, int speed);
+    void setConfigValues(int xPixels, int yPixels, int speed,
+                         int xOrigin, int yOrigin);
     int  cfgXPixels() const;
     int  cfgYPixels() const;
     int  cfgSpeed() const;
+    int  cfgXOrigin() const;      /* 作业原点 X（像素，2 字节大端） */
+    int  cfgYOrigin() const;      /* 作业原点 Y（像素，2 字节大端） */
 
     /* 生成配置包的 64 字节载荷（不含帧头/控制位/CRC/帧尾）。
        发送与「仅打包」预览共用，保证两处字节完全一致。静态，便于预览复用。 */
-    static QByteArray buildConfigPayload(int xPixels, int yPixels, int speed);
+    static QByteArray buildConfigPayload(int xPixels, int yPixels, int speed,
+                                         int xOrigin, int yOrigin);
 
     /* ---- 流式推送 ---- */
     /* 开一幅图：记录尺寸/行号，弓字形倒序在这里生效 */
@@ -232,6 +240,25 @@ public:
        不能用"见了 0xAA 就收"的宽松扫描 —— 否则下行包的回显会被误判。 */
     static QByteArray reqDataFrame();    /* {0x55, 0x44, 0xAA} */
     static QByteArray reqConfigFrame();  /* {0x55, 0x55, 0xAA} */
+
+    /* ---- 固件错误上报（固件 → 上位机，3 字节）----
+       0x55 0x10 0xAA   固件接收超时：它已经发出 0x44 请求，但在自己的超时窗口
+                        （固件侧 REPLY_TIMEOUT_MS，默认 1 秒）内没收到完整的 69 字节
+                        数据包，固件 OLED 会显示 BT_RX TIMEOUT!!!。
+                        上位机必须把"固件为什么收不到数据"讲清楚 ——
+                        最常见的原因就是本机发送队列是空的（没点「发送整幅图」）。 */
+    static QByteArray initTimeoutFrame(); /* {0x55, 0x10, 0xAA} */
+
+    /* ---- 启动握手（固件先报告就绪，上位机再下令开始）----
+       固件进 main() 后先停在 waiting() 里，反复发 0x55 0x77 0xAA 报告"我准备好了"；
+       上位机收到就知道板子已就绪，等用户点「发送整幅图」把队列装好，
+       再回一个 0x55 0x66 0xAA 让固件进入 BT_Init() 开始要数据。
+       这样彻底避开"固件在 main() 开头就要数据、用户根本来不及点"的时序问题。 */
+    static QByteArray readyFrame();  /* {0x55, 0x77, 0xAA}  固件 → 上位机 */
+    static QByteArray startFrame();  /* {0x55, 0x66, 0xAA}  上位机 → 固件 */
+
+    /* 下发启动命令（帧 55 66 AA）。返回 true = 已写进串口 */
+    bool sendStart();
 
     /* 握手超时（毫秒）：等待 0x44 超过这个时间没等到就报错停发。
        0 = 不超时（一直等）。默认 3000。 */
@@ -269,6 +296,16 @@ signals:
     void modeChanged(int mode);
     /* 收到任意上行字节（用于界面显示"我到底听到没有"） */
     void rxActivity(qint64 totalBytes);
+
+    /* 固件主动上报的错误（帧 55 <code> AA）。
+       code 目前只有 CtrlInitTimeout(0x10)；msg 是已写好的中文原因说明，界面直接显示即可。
+       与 errorOccurred（串口自身出错）区分开：这条是"固件活着、但在抱怨"，
+       说明串口链路是通的，问题出在数据供给或时序上。 */
+    void firmwareError(int code, const QString &msg);
+
+    /* 收到固件的就绪通知（帧 55 77 AA），count = 累计次数。
+       固件会在 waiting() 里反复发，直到上位机回 0x55 0x66 0xAA 为止。 */
+    void firmwareReady(int count);
 
 private slots:
     void onTimerTick();
@@ -308,6 +345,8 @@ private:
     QByteArray   m_rxBuf;         /* 上行字节累积缓冲（3 字节滑动窗） */
     int          m_reqCount;      /* 收到的取数据请求(0x44)总数 */
     int          m_cfgReqCount;   /* 收到的取配置请求(0x55)总数 */
+    int          m_fwErrCount;    /* 收到的固件超时上报(0x10)总数 */
+    int          m_readyCount;    /* 收到的固件就绪通知(0x77)总数 */
     int          m_hsSent;        /* 握手模式下已下发的包数 */
     int          m_hsTimeoutMs;
     bool         m_finished;      /* 本幅图已完成标记，防重复 emit */
@@ -326,6 +365,8 @@ private:
     int          m_cfgX;
     int          m_cfgY;
     int          m_cfgSpeed;
+    int          m_cfgXOrigin;    /* 作业原点 X（像素，2 字节大端） */
+    int          m_cfgYOrigin;    /* 作业原点 Y（像素，2 字节大端） */
 
     /* 图像级状态（beginImage 时重置） */
     int          m_imgW;

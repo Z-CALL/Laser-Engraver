@@ -101,6 +101,9 @@ typedef enum state{
 	extern uint8_t work_cusor;
 	extern uint8_t work_cusor_point;
 	extern volatile uint8_t work_cusor_flag;
+	
+	extern uint32_t x_work_orgin;
+	extern uint32_t y_work_orgin;
 
 /* USER CODE END EC */
 

@@ -47,7 +47,9 @@ Widget::Widget(QWidget *parent) :
        所以它一开始就得有正确的 X/Y/速度 */
     m_ser->setConfigValues(m_cfgXSpin->value(),
                            m_cfgYSpin->value(),
-                           m_cfgSpeedSpin->value());
+                           m_cfgSpeedSpin->value(),
+                           m_cfgXOrgSpin->value(),
+                           m_cfgYOrgSpin->value());
 
     /* 默认握手模式：固件来要才发，比定时器猜间隔可靠得多 */
     m_ser->setHandshakeTimeout(m_serHsTimeoutSpin->value());
@@ -72,6 +74,10 @@ Widget::Widget(QWidget *parent) :
             this, SLOT(onSerialHandshakeTimeout(int,int)));
     connect(m_ser, SIGNAL(rxActivity(qint64)),
             this, SLOT(onSerialRxActivity(qint64)));
+    connect(m_ser, SIGNAL(firmwareError(int,QString)),
+            this, SLOT(onSerialFirmwareError(int,QString)));
+    connect(m_ser, SIGNAL(firmwareReady(int)),
+            this, SLOT(onSerialFirmwareReady(int)));
     connect(m_ser, SIGNAL(configRequestReceived(int)),
             this, SLOT(onSerialConfigRequest(int)));
 
@@ -309,6 +315,21 @@ void Widget::buildUi()
     m_cfgSpeedSpin->setValue(100);
     m_cfgSpeedSpin->setToolTip(QStringLiteral(
         "加工速度。1 字节，0~255，单位由固件定义。"));
+
+    /* 作业原点：图像起点相对机器原点（回零点）的偏移，单位 = 像素点。 */
+    m_cfgXOrgSpin = new QSpinBox(m_mainPage);
+    m_cfgXOrgSpin->setRange(0, 65535);
+    m_cfgXOrgSpin->setValue(0);
+    m_cfgXOrgSpin->setToolTip(QStringLiteral(
+        "X 轴作业原点：图像起始点相对机器原点的偏移（像素点）。\n"
+        "2 字节，大端，字段标签 0x77。"));
+    m_cfgYOrgSpin = new QSpinBox(m_mainPage);
+    m_cfgYOrgSpin->setRange(0, 65535);
+    m_cfgYOrgSpin->setValue(0);
+    m_cfgYOrgSpin->setToolTip(QStringLiteral(
+        "Y 轴作业原点：图像起始点相对机器原点的偏移（像素点）。\n"
+        "2 字节，大端，字段标签 0x88。"));
+
     m_serConfigBtn = new QPushButton(QStringLiteral("下发配置"), m_mainPage);
     m_serConfigBtn->setMinimumHeight(30);
     m_serConfigBtn->setToolTip(QStringLiteral(
@@ -325,6 +346,10 @@ void Widget::buildUi()
     cfgRow->addWidget(m_cfgYSpin);
     cfgRow->addWidget(new QLabel(QStringLiteral("速度"), m_mainPage));
     cfgRow->addWidget(m_cfgSpeedSpin);
+    cfgRow->addWidget(new QLabel(QStringLiteral("原点X"), m_mainPage));
+    cfgRow->addWidget(m_cfgXOrgSpin);
+    cfgRow->addWidget(new QLabel(QStringLiteral("Y"), m_mainPage));
+    cfgRow->addWidget(m_cfgYOrgSpin);
     cfgRow->addWidget(m_serConfigBtn);
     main->addLayout(cfgRow);
 
@@ -404,6 +429,8 @@ void Widget::buildUi()
     connect(m_cfgXSpin,         SIGNAL(valueChanged(int)), this, SLOT(onCfgValueChanged()));
     connect(m_cfgYSpin,         SIGNAL(valueChanged(int)), this, SLOT(onCfgValueChanged()));
     connect(m_cfgSpeedSpin,     SIGNAL(valueChanged(int)), this, SLOT(onCfgValueChanged()));
+    connect(m_cfgXOrgSpin,      SIGNAL(valueChanged(int)), this, SLOT(onCfgValueChanged()));
+    connect(m_cfgYOrgSpin,      SIGNAL(valueChanged(int)), this, SLOT(onCfgValueChanged()));
     connect(m_serIntervalSpin,  SIGNAL(valueChanged(int)),
             this, SLOT(onSerialIntervalChanged(int)));
     connect(m_serModeCombo,     SIGNAL(currentIndexChanged(int)),
@@ -587,6 +614,43 @@ void Widget::onSerialRxActivity(qint64 totalBytes)
 }
 
 /**
+ * 固件主动上报的错误：帧 0x55 0x10 0xAA（对应固件的 BT_INIT_TIMEOUT）。
+ *
+ * ★ 这条信息比"上位机没反应"有价值得多 —— 它证明串口链路是通的、板子在正常跑，
+ *   只是固件拿不到它要的数据。所以重点不是"报个错"，而是给出**下一步该做什么**。
+ *
+ * 详细原因已由 SerialIo 经日志回调打出来（见 onReadyRead 里的错误分支），
+ * 这里只做状态栏的醒目提示，避免同一段文字打两遍。
+ */
+void Widget::onSerialFirmwareError(int code, const QString &msg)
+{
+    Q_UNUSED(code);
+    Q_UNUSED(msg);
+
+    setStatus(QStringLiteral("★ 固件报错：蓝牙接收超时 —— 原因与操作顺序见日志区"), false);
+
+    if (m_serInfo)
+        m_serInfo->setStyleSheet("color: orange;");
+}
+
+/**
+ * 收到固件的就绪通知（帧 55 77 AA）—— 板子已停在 waiting()，等上位机下令。
+ *
+ * 这是新启动握手的"上半段"：固件先把"我准备好了"说出来，
+ * 上位机再去装载队列、发 55 66 AA 让它开始。
+ * 所以这里只做提示，不自动发任何东西 —— 什么时候启动由用户决定。
+ */
+void Widget::onSerialFirmwareReady(int count)
+{
+    setStatus(QStringLiteral("★ 固件已就绪（第 %1 次通知）—— 请点「发送整幅图」，"
+                             "装载完会自动下发 55 66 AA 启动")
+              .arg(count), true);
+
+    if (m_serInfo)
+        m_serInfo->setStyleSheet("color: green;");
+}
+
+/**
  * 只打包含、不落端口：用来在没接硬件时核对协议。
  *
  * 把第 0 行（自然序）与第 1 行（弓字形时倒序）的头几包打印出来，
@@ -602,7 +666,9 @@ void Widget::onSerialPreview()
         const int cx = m_cfgXSpin->value();
         const int cy = m_cfgYSpin->value();
         const int cs = m_cfgSpeedSpin->value();
-        const QByteArray cp = SerialIo::buildConfigPayload(cx, cy, cs);
+        const int cox = m_cfgXOrgSpin->value();
+        const int coy = m_cfgYOrgSpin->value();
+        const QByteArray cp = SerialIo::buildConfigPayload(cx, cy, cs, cox, coy);
 
         QString chex;
         for (int i = 0; i < cp.size(); ++i)
@@ -610,9 +676,9 @@ void Widget::onSerialPreview()
             if (i && (i % 16 == 0)) chex += QStringLiteral(" ");
             chex += QStringLiteral("%1 ").arg((quint8)cp.at(i), 2, 16, QChar('0')).toUpper();
         }
-        logMsg(QStringLiteral("[配置包 0x33] X=%1(2B大端) Y=%2(2B大端) 速度=%3(1B)，"
-                              "后 56 字节 0xFF 填充")
-               .arg(cx).arg(cy).arg(cs), true);
+        logMsg(QStringLiteral("[配置包 0x33] X=%1(2B大端) Y=%2(2B大端) 速度=%3(1B) "
+                              "原点X=%4(2B大端) 原点Y=%5(2B大端)，后 50 字节 0xFF 填充")
+               .arg(cx).arg(cy).arg(cs).arg(cox).arg(coy), true);
         logMsg(QStringLiteral("  载荷 64B: %1").arg(chex.trimmed()), true);
         logMsg(QStringLiteral("  完整包 = 0x55 0x33 | 上述 64B | CRC16H CRC16L | 0xAA"
                               "（CRC 覆盖控制位+载荷 = 65 字节，与数据包同算法）"), true);
@@ -697,16 +763,19 @@ void Widget::onCfgValueChanged()
     if (m_ser)
         m_ser->setConfigValues(m_cfgXSpin->value(),
                                m_cfgYSpin->value(),
-                               m_cfgSpeedSpin->value());
+                               m_cfgSpeedSpin->value(),
+                               m_cfgXOrgSpin->value(),
+                               m_cfgYOrgSpin->value());
 }
 
 /** 固件发 0x55 0x55 0xAA 来要配置：SerialIo 已经回好了，这里只更新界面状态。 */
 void Widget::onSerialConfigRequest(int seq)
 {
     setStatus(QStringLiteral("固件请求配置第 %1 次 → 已回 0x33 配置包"
-                             "（X=%2 Y=%3 速度=%4）")
+                             "（X=%2 Y=%3 速度=%4 原点=(%5,%6)）")
               .arg(seq).arg(m_cfgXSpin->value())
-              .arg(m_cfgYSpin->value()).arg(m_cfgSpeedSpin->value()), true);
+              .arg(m_cfgYSpin->value()).arg(m_cfgSpeedSpin->value())
+              .arg(m_cfgXOrgSpin->value()).arg(m_cfgYOrgSpin->value()), true);
 }
 
 /**
@@ -738,8 +807,10 @@ void Widget::onSerialSendConfig()
 
     if (m_ser->sendConfigPacket(x, y, s))
     {
-        setStatus(QStringLiteral("配置已下发：X=%1 Y=%2 速度=%3（69 字节，CRC 覆盖 65 字节）")
-                  .arg(x).arg(y).arg(s), true);
+        setStatus(QStringLiteral("配置已下发：X=%1 Y=%2 速度=%3 原点=(%4,%5)"
+                                 "（69 字节，CRC 覆盖 65 字节）")
+                  .arg(x).arg(y).arg(s)
+                  .arg(m_cfgXOrgSpin->value()).arg(m_cfgYOrgSpin->value()), true);
     }
     else
     {
@@ -831,9 +902,21 @@ void Widget::onSerialSend()
        不会走 onSerialFinished。所以这里要自己把状态摆成"已装载、待命"。 */
     if (hs && m_ser->isOpen())
     {
-        setStatus(QStringLiteral("数据已装载 %1 包，待命中 —— 等固件发 0x55 0x44 0xAA，"
-                                 "来一个发一个（固件不说话就一直等，可点中止退出）")
-                  .arg(m_serBar->maximum()), true);
+        /* ★ 队列装载完毕，现在才通知固件"可以开始了"（帧 55 66 AA）。
+           顺序不能反 —— 固件一收到这个命令就会立刻进 BT_Init() 开始要数据，
+           必须先等队列装好，否则它第一轮就扑空、白等一个超时。
+           固件那边此时正停在 waiting() 里反复发 55 77 AA 等这一帧。 */
+        if (m_ser->sendStart())
+        {
+            setStatus(QStringLiteral("已下发启动命令（55 66 AA），队列 %1 包待取 —— "
+                                     "等固件发 0x55 0x44 0xAA，来一个发一个")
+                      .arg(m_ser->pendingPackets()), true);
+        }
+        else
+        {
+            setStatus(QStringLiteral("数据已装载 %1 包，但启动命令下发失败 —— 见日志")
+                      .arg(m_serBar->maximum()), false);
+        }
     }
 }
 

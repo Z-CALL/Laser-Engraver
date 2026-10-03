@@ -451,9 +451,22 @@ uint16_t USART3_RxPoll(void)
 
 /* 手动 DMA 发送 */
 void USART3_SendDMA(const uint8_t *buf, uint16_t len)
-{
-  if (huart3.gState != HAL_UART_STATE_READY) { return; }       /* 上一包没发完 */
-  (void)HAL_UART_Transmit_DMA(&huart3, (uint8_t *)buf, len);
+{    
+	hdma_usart3_tx.XferCpltCallback     = NULL;
+    hdma_usart3_tx.XferHalfCpltCallback = NULL;
+    hdma_usart3_tx.XferErrorCallback    = NULL;
+
+    ATOMIC_CLEAR_BIT(USART3->CR3, USART_CR3_DMAT);
+    hdma_usart3_tx.State = HAL_DMA_STATE_READY;
+
+    if (HAL_DMA_Start_IT(&hdma_usart3_tx,
+                         (uint32_t)buf,
+                         (uint32_t)&USART3->DR,
+                         len) != HAL_OK)
+    {
+        return;
+    }
+    ATOMIC_SET_BIT(USART3->CR3, USART_CR3_DMAT);
 }
 
 

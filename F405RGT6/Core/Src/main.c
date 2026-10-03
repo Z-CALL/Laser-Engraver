@@ -59,10 +59,10 @@ conformation x, y;
 volatile state sys_state;
 uint8_t* alarm;
 
-uint8_t ctrl_req[3] = {0x55, 0x44, 0xAA};   			/* 换成你的 3 字节内容 */
+uint8_t ctrl_req[3] = {0x55, 0x44, 0xAA};   			  /* 换成你的 3 字节内容 */
 uint8_t req_pending = 0;                          	/* 1 = 已发出，等 67 字节回包 */
 uint32_t req_sent_ms = 0;
-volatile uint8_t need_send_ctl = 0;   				/* 1 = 该发控制信号了 */
+volatile uint8_t need_send_ctl = 0;   				      /* 1 = 该发控制信号了 */
 uint8_t RX_number = 0;
 uint8_t RX_data[8][64] = {0};
 uint8_t RX_Ctl[8];
@@ -70,6 +70,9 @@ uint8_t RX_write_cusor = 0;
 uint8_t work_cusor = 0;
 uint8_t work_cusor_point = 0;
 volatile uint8_t work_cusor_flag = 0;
+
+uint32_t x_work_orgin = 0;
+uint32_t y_work_orgin = 0;
 
 
 
@@ -131,6 +134,11 @@ int main(void)
   
   OLED_Init();
   
+  laser_close();
+  
+  //test_laser_PWM_fre_limit_24V();
+  homing();
+  
   
   //test_homing();
   //test_go_to_point();
@@ -151,17 +159,18 @@ int main(void)
 			while(1);
 		}
 	}
-	(void)BT_Init();
+	waiting();
+	goto_point(x_work_orgin,y_work_orgin);
+	x.cur_point = 0;
+	y.cur_point = 0;
 	work_cusor = 0;
 
-    //homing();
-	
-	  htim2.Init.Period    = RASTER_TIM2_PERIOD;
-	  htim2.Init.Prescaler = 0U;
-	  (void)HAL_TIM_Base_Init(&htim2);
-	  __HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_UPDATE);
+	htim2.Init.Period    = RASTER_TIM2_PERIOD;
+	htim2.Init.Prescaler = 0U;
+	(void)HAL_TIM_Base_Init(&htim2);
+	__HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_UPDATE);
 
-	  HAL_TIM_Base_Start_IT(&htim2);
+	HAL_TIM_Base_Start_IT(&htim2);
 	
 	sys_state = working;
 	
@@ -176,7 +185,7 @@ int main(void)
 	if(RX_write_cusor != work_cusor && req_pending == 0){
 	  RX_number = 0;
 	  USART3_RxStart();
-      USART3_SendDMA(ctrl_req, 3);
+	  Send_Next();
       req_sent_ms = HAL_GetTick();
       req_pending = 1;
 	}
@@ -216,8 +225,11 @@ int main(void)
         alarm = Creat_alarm(RX_data[work_cusor][work_cusor_point] * 9);
         if(alarm == NULL){
             HAL_TIM_Base_Stop_IT(&htim2);
+			OLED_Clear();
             char program_error[] = {"program error!!!"};
             OLED_ShowString(0, 0, program_error, OLED_FONT_08, 1);
+            char program_error_1[] = {"delay_error!!!"};
+            OLED_ShowString(0, 16, program_error_1, OLED_FONT_08, 1);
             OLED_Refresh();
             while(1);
         }

@@ -51,47 +51,62 @@ void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, CS_Pin|GPIO_PIN_8, GPIO_PIN_RESET);
+  /* ---- 步进电机 / 限位引脚统一走 configure.h 的宏 ----
+     配置项（x_dir / x_plus / x_enable、y 轴三根、x_limit 系列、y_limit 系列）
+     都定义在 Core/Inc/configure.h，换接线时只改那一处，不必动本文件。
+     注意：每个宏的 _grop 都是它自己的端口，本文件的物理端口名
+     （GPIOA / GPIOC / GPIOB）与它们一一对应，分组保持与原来一致。 */
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, DC_Pin|RST_Pin|GPIO_PIN_8|GPIO_PIN_9, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(x_dir_grop, CS_Pin|x_dir_pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_12|GPIO_PIN_13
-                          |GPIO_PIN_14|GPIO_PIN_15|GPIO_PIN_3|GPIO_PIN_5
-                          |Jiangguang_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(x_enable_grop, DC_Pin|RST_Pin|x_enable_pin|x_plus_pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : PC0 PC1 PC2 PC3 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3;
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(y_dir_grop, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_12|y_enable_pin
+                          |y_plus_pin|y_dir_pin|GPIO_PIN_3|GPIO_PIN_5, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : x_limit_r x_limit_l y_limit_u y_limit_d */
+  GPIO_InitStruct.Pin = x_limit_r_pin|x_limit_l_pin|y_limit_u_pin|y_limit_d_pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+  HAL_GPIO_Init(x_limit_r_grop, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : CS_Pin PA8 */
-  GPIO_InitStruct.Pin = CS_Pin|GPIO_PIN_8;
+  /*Configure GPIO pins : CS_Pin x_dir_pin */
+  GPIO_InitStruct.Pin = CS_Pin|x_dir_pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  HAL_GPIO_Init(x_dir_grop, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : DC_Pin RST_Pin PC8 PC9 */
-  GPIO_InitStruct.Pin = DC_Pin|RST_Pin|GPIO_PIN_8|GPIO_PIN_9;
+  /*Configure GPIO pins : DC_Pin RST_Pin x_enable_pin x_plus_pin */
+  GPIO_InitStruct.Pin = DC_Pin|RST_Pin|x_enable_pin|x_plus_pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+  HAL_GPIO_Init(x_enable_grop, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PB0 PB1 PB12 PB13
-                           PB14 PB15 PB3 PB5
-                           Jiangguang_Pin */
-  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_12|GPIO_PIN_13
-                          |GPIO_PIN_14|GPIO_PIN_15|GPIO_PIN_3|GPIO_PIN_5
-                          |Jiangguang_Pin;
+  /*Configure GPIO pins : PB0 PB1 PB12 y_enable_pin
+                           y_plus_pin y_dir_pin PB3 PB5 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_12|y_enable_pin
+                          |y_plus_pin|y_dir_pin|GPIO_PIN_3|GPIO_PIN_5;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  HAL_GPIO_Init(y_dir_grop, &GPIO_InitStruct);
+
+  /* ---- 激光输出单独一组 ----
+     走 configure.h 的 Laser_grop / Laser_pin（当前是 PA15），
+     换激光接线只改那一处，不必动本文件。 */
+  HAL_GPIO_WritePin(Laser_grop, Laser_pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : Laser_pin */
+  GPIO_InitStruct.Pin = Laser_pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(Laser_grop, &GPIO_InitStruct);
 
 }
 
