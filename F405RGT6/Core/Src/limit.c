@@ -183,6 +183,10 @@ int goto_point(int x_point,int y_point){
 			y.lock = 1;
 		}
 		if(x.lock ==1 && y.lock ==1){
+			x.lock = 0;
+			y.lock = 0;
+			x.divide_step = 0;
+			y.divide_step = 0;
 			return 1;
 		}
 		if(times > GOTO_POINT_TIMEOUT){

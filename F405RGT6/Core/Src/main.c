@@ -141,7 +141,7 @@ int main(void)
   
   
   //test_homing();
-  //test_go_to_point();
+//  test_go_to_point();
 //  test_laser_PWM_fre_limit_24V();
 //  test_delay();
 
@@ -159,6 +159,10 @@ int main(void)
 			while(1);
 		}
 	}
+	
+	OLED_ShowNum(0,16,y.all_point,OLED_FONT_08, 1);
+	OLED_ShowNum(0,32,x.all_point,OLED_FONT_08, 1);
+    OLED_Refresh();
 	waiting();
 	goto_point(x_work_orgin,y_work_orgin);
 	x.cur_point = 0;
@@ -212,7 +216,11 @@ int main(void)
       if(y.cur_point >= y.all_point){
         HAL_TIM_Base_Stop_IT(&htim2);
         laser_close();
+		OLED_Clear();
         char program_end[] = {"program end!"};
+        OLED_ShowString(0, 0, program_end, OLED_FONT_08, 1);
+		OLED_ShowNum(0,16,y.cur_point,OLED_FONT_08, 1);
+		OLED_ShowNum(0,32,x.cur_point,OLED_FONT_08, 1);
         OLED_ShowString(0, 0, program_end, OLED_FONT_08, 1);
         OLED_Refresh();
         while(1);
@@ -221,8 +229,10 @@ int main(void)
       if(x.add_flag){
         x.add_flag = 0;
         laser_open();
-        //set_delay_time(((test_image[y.cur_point][x.cur_point]/25U) + 1) *240);
-        alarm = Creat_alarm(RX_data[work_cusor][work_cusor_point] * 9);
+		  
+#if TIME_DELAY
+		  
+        alarm = Creat_alarm(RX_data[work_cusor][work_cusor_point] * LASER_POWER);
         if(alarm == NULL){
             HAL_TIM_Base_Stop_IT(&htim2);
 			OLED_Clear();
@@ -233,6 +243,13 @@ int main(void)
             OLED_Refresh();
             while(1);
         }
+		  
+#else
+		  
+        set_delay_time(RX_data[work_cusor][work_cusor_point] * LASER_POWER);
+		  
+#endif
+
 		work_cusor_point++;
 		if(work_cusor_point == 64 && work_cusor_flag == 0){
 			work_cusor++;
@@ -245,13 +262,18 @@ int main(void)
 	  
 
       delay_till();
-
+	  
+#if TIME_DELAY
+	  
       if((alarm != NULL) && (*alarm)){
         laser_close();
         *alarm = 0;
         free(alarm);
         alarm = NULL;
       }
+	  
+#endif
+	  
 	  if(work_cusor_flag){
 		  
 		work_cusor_flag = 0;

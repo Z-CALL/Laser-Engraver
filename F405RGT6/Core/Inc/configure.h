@@ -32,6 +32,9 @@ extern uint16_t RASTER_TIM2_PERIOD;
 //串口接收数据包超时，这里是1S
 #define REPLY_TIMEOUT_MS  1000U
 
+//激光使用的定时方式，1代表使用链表定时（可实现多任务定时），0代表使用延时定时（只支持单任务）
+#define TIME_DELAY 0
+
 
 
 

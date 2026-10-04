@@ -1,5 +1,6 @@
 #include "bsp_delay.h"
 #include "stdlib.h"
+#include "laser.h"
 
 static uint32_t s_cpu_freq_mhz = 168U;
 static uint8_t  s_delay_inited = 0U;
@@ -97,6 +98,8 @@ void set_delay_time(uint64_t us_time){
     return;
 }
 
+#if TIME_DELAY
+
 void delay_till(void){
     if (s_delay_inited == 0U)
     {
@@ -120,21 +123,26 @@ void delay_till(void){
     return;
 }
 
-// void delay_till(void){
-//     if (s_delay_inited == 0U)
-//     {
-//         BSP_DelayInit();
-//     }
+#else
 
-//     if ((DWT->CYCCNT - clock.start_time) < clock.delay_ticks)
-//     {
-//         clock.start_lock = 1;
-//     }else{
-//         clock.start_lock = 0;
-//         clock.alarm = 1;
-//     }
-//     return;
-// }
+ void delay_till(void){
+     if (s_delay_inited == 0U)
+     {
+         BSP_DelayInit();
+     }
+
+     if ((DWT->CYCCNT - clock.start_time) < clock.delay_ticks)
+     {
+         clock.start_lock = 1;
+     }else{
+         clock.start_lock = 0;
+         clock.alarm = 1;
+			laser_close();
+     }
+     return;
+ }
+
+#endif
 
 void BSP_DelayMs(uint32_t ms)
 {

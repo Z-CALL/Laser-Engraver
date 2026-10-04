@@ -36,15 +36,21 @@ void test_laser_PWM_fre_limit_12V(void)
 
 void test_laser_PWM_fre_limit_24V(void)
 {
-    for(int j = 0 ; j < 10; j++){
-        for(int i = 0 ; i < 200 ; i++){             //1K PWM
+	x.all_point = 1000000;
+	y.all_point = 1000000;
+    HAL_GPIO_TogglePin(x_dir_grop, x_dir_pin);
+	sys_state = working;
+	HAL_TIM_Base_Start_IT(&htim2);
+    for(int j = 0 ; j < 30; j++){
+        for(int i = 0 ; i < 50 ; i++){             //1K PWM
             laser_open();
-            BSP_DelayUs(300 - 30*j);
+            BSP_DelayUs(300 - 10*j);
             laser_close();
-            BSP_DelayUs(700 + 30 * j);
+            BSP_DelayUs(700 + 10 * j);
         }
-        BSP_DelayMs(200);
+        BSP_DelayMs(50);
     }
+    HAL_TIM_Base_Stop_IT(&htim2);
     while(1);
 }
 
