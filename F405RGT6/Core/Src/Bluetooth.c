@@ -110,12 +110,8 @@ int8_t BT_Init(){
 	  }
 	  
 	  if(usart3_cmd_buf[0] == 0x55 && usart3_cmd_buf[68] == 0xAA){
-		  memcpy(RX_data[RX_write_cusor], usart3_cmd_buf + 2, 64);
+		  memcpy(RX_data[(RX_write_cusor % 8)], usart3_cmd_buf + 2, 64);
 		  RX_write_cusor++;
-	  
-		  if(RX_write_cusor >= 8){
-			  RX_write_cusor = 0;
-		  }
 	  }
 	  
   }

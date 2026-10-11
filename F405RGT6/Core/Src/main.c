@@ -178,6 +178,9 @@ int main(void)
 	
 	sys_state = working;
 	
+	for(int i = 0; i < 8; i++){
+	  USART3_SendDMA(RX_data[i],64);
+	}
 	
   /* USER CODE END 2 */
 
@@ -186,23 +189,28 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-	if(RX_write_cusor != work_cusor && req_pending == 0){
+	if((work_cusor > RX_write_cusor) && (req_pending == 0)){
 	  RX_number = 0;
 	  USART3_RxStart();
+	  USART3_SendDMA(RX_data[((RX_write_cusor - 1) % 8)],64);
 	  Send_Next();
       req_sent_ms = HAL_GetTick();
       req_pending = 1;
+	}else{
+		OLED_Clear();
+        char program_end[] = {"cusor error!!!"};
+        OLED_ShowString(0, 0, program_end, OLED_FONT_08, 1);
+        OLED_Refresh();
 	}
 		
       RX_number = USART3_RxPoll();
       if(RX_number == USART3_CMD_BUF_SIZE){
 		if(usart3_cmd_buf[0] == 0x55 && usart3_cmd_buf[68] == 0xAA){
-			memcpy(RX_data[RX_write_cusor], usart3_cmd_buf + 2, 64);
-			RX_Ctl[RX_write_cusor] = usart3_cmd_buf[1];
+			memcpy(RX_data[(RX_write_cusor % 8)], usart3_cmd_buf + 2, 64);
+			usart3_cmd_buf[0] = 0x00;
+			usart3_cmd_buf[68] = 0x00;
+			RX_Ctl[(RX_write_cusor % 8)] = usart3_cmd_buf[1];
 			RX_write_cusor++;
-			if(RX_write_cusor >= 8){
-			  RX_write_cusor = 0;
-			}
 			req_pending = 0;
 		}
 		USART3_RxStart();
@@ -246,16 +254,14 @@ int main(void)
 		  
 #else
 		  
-        set_delay_time(RX_data[work_cusor][work_cusor_point] * LASER_POWER);
+        set_delay_time(RX_data[(work_cusor % 8)][work_cusor_point] * LASER_POWER);
 		  
 #endif
 
 		work_cusor_point++;
-		if(work_cusor_point == 64 && work_cusor_flag == 0){
+		if(work_cusor_point == 64 || work_cusor_flag == 1){
+			work_cusor_flag = 0;
 			work_cusor++;
-			if(work_cusor == 8){
-				work_cusor = 0;
-			}
 			work_cusor_point = 0;
 		}
       }
@@ -274,15 +280,6 @@ int main(void)
 	  
 #endif
 	  
-	  if(work_cusor_flag){
-		  
-		work_cusor_flag = 0;
-		work_cusor++;
-		if(work_cusor == 8){
-			work_cusor = 0;
-		}
-		work_cusor_point = 0;
-	  }
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */

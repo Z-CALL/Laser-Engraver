@@ -257,7 +257,7 @@ void TIM2_IRQHandler(void)
             y.divide_step++;
             if( y.divide_step >= step_divide_x2){
               y.cur_point++;
-              y.divide_step = 0;
+              y.divide_step = 0U;
               y.lock = 0;
             }
           }else{
