@@ -141,6 +141,38 @@ public:
         CtrlReady   = 0x77  /* 上行：固件就绪通知（帧 55 77 AA） */
     };
 
+    /* ==================== 雕刻回传（固件 → 上位机） ====================
+       固件每画完一个像素回传一条，上位机实时画到监看画布上。
+
+         偏移  长度  内容
+           0     1   0x33          帧头
+           1     1   出光灰度值     （固件实际用的那个值，0~255）
+           2     1   0xEE          帧尾
+
+       ★ 为什么必须改解析方式（本文件最关键的一处改动）：
+         请求帧是 55 xx AA（以 0x55 开头），回传帧是 33 gg EE（以 0x33 开头）。
+         老解析器"在整个缓冲里搜 55 xx AA"，而回传帧的灰度字节是 0~255 任意值，
+         连发的回传帧**跨帧拼凑**时很容易凑出 "55 44 AA" 这种假请求帧，
+         会让上位机多发数据包 → 握手错乱 → 雕刻中途卡死。
+         所以改成"按首字节分派 + 固定长度整体消费"的状态机。
+
+       ★ 帧里不带坐标，只带灰度值 —— 上位机按"第几个到达"依次落点。
+         这恰好是最有价值的监控视角：画出来的是**固件实际的输出顺序**，
+         固件若重复/跳行/错位，画面上会立刻显形。 */
+    enum { ReportFrameBytes = 3, ReportHead = 0x33, ReportTail = 0xEE };
+
+    /* 回传统计：收到多少条、丢弃多少条（帧尾不符） */
+    int reportCount() const;
+    int reportDropped() const;
+    void resetReportStats();
+
+    /* 回传监看开关：关掉后解析器不再尝试解析回传帧 */
+    void setReportWatch(bool on);
+    bool reportWatch() const;
+
+    /* 组装一条回传帧（用于上位机自检 / 模拟发端） */
+    static QByteArray buildReportFrame(quint8 gray);
+
     /* 校验位（对应界面下拉框，避免在头文件里引入 QSerialPort） */
     enum Parity { ParityNone = 0, ParityOdd = 1, ParityEven = 2 };
 
@@ -307,6 +339,10 @@ signals:
        固件会在 waiting() 里反复发，直到上位机回 0x55 0x66 0xAA 为止。 */
     void firmwareReady(int count);
 
+    /* 固件回传了一个像素：seq = 第几个到达（从 0 开始），gray = 出光灰度值。
+       ★ 界面按 seq 依次落点，画出的就是固件实际的输出顺序。 */
+    void pixelReported(int seq, int gray);
+
 private slots:
     void onTimerTick();
     void onBytesWritten(qint64 n);
@@ -328,6 +364,8 @@ private:
     void finishHandshake(bool aborted);
     /* 用当前 m_cfg* 值打包一个配置包并直接写串口 */
     bool writeConfigPacket();
+    /* 回传异常日志限流（回传帧连续不断，格式错会刷屏） */
+    bool mayLogReport();
 
     QSerialPort *m_port;
     QTimer      *m_timer;
@@ -354,6 +392,16 @@ private:
     qint64       m_rxTotal;       /* 自打开以来收到的上行字节总数 */
     bool         m_firstReqSeen;  /* 是否已收到过第一个 0x44 请求（决定超时表何时起） */
     qint64       m_lastRxLogMs;   /* 上行日志限流，防止垃圾流刷爆日志窗口 */
+
+    /* ---- 雕刻回传监看 ----
+       ★ 解析从"搜 55 xx AA"改成"按首字节分派的状态机"：
+           首字节 0x33 → 按回传帧收 3 字节（33 gg EE）
+           首字节 0x55 → 按请求帧收 3 字节（55 xx AA）
+         两种帧混在同一字节流里也不会互相误判。 */
+    bool         m_reportWatch;
+    int          m_reportCount;
+    int          m_reportDropped;
+    int          m_lastReportLogMs;
 
     /* 串口参数（默认按需求：115200 / 8 / 奇 / 1） */
     int          m_cfgBaud;

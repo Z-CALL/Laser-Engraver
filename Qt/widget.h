@@ -65,6 +65,8 @@ private slots:
     void onSerialRxActivity(qint64 totalBytes);
     void onSerialFirmwareError(int code, const QString &msg);
     void onSerialFirmwareReady(int count);
+    void onSerialPixelReported(int seq, int gray);   /* 固件回传一个像素 */
+    void onViewSwap();                                /* 灰度预览 ⇄ 回传监看 */
 
     /* 内嵌文件浏览面板 */
     void onFbUp();
@@ -87,6 +89,17 @@ private:
                           const QString &suggested = QString());
     void refreshFbList();
     QStringList fbCurrentPatterns() const;
+
+    /* ---- 雕刻回传监看 ----
+       固件每画完一个像素回传一条（0x33 灰度 0xEE），这里把点依次打到画布上。
+       ★ 按"第几个到达"落点：固件不报坐标，而按到达顺序画出来的正是
+         **固件实际的输出顺序** —— 重复 / 跳行 / 错位会直接在画面上显形。 */
+    void monitorBegin(int w, int h);   /* 开工：清空画布、切到监看页 */
+    void monitorFeed(int gray);
+    void monitorEnd(bool aborted);
+    void monitorRepaint();
+    void showViewPage(int page);       /* 0 = 灰度预览, 1 = 回传监看 */
+    void updateViewSwapBtn();
 
     Ui::Widget *ui;
 
@@ -137,6 +150,19 @@ private:
     int           m_serSentPkts;       /* 已发包数，握手进度显示用 */
     int           m_serTotalPkts;      /* 本幅图总包数 */
     qint64        m_serRxBytes;        /* 自打开以来收到的上行字节数 */
+
+    /* ---- 雕刻回传监看 ---- */
+    QStackedWidget *m_viewStack;       /* 0 = 灰度预览, 1 = 回传监看 */
+    QLabel       *m_viewTitle;         /* 当前页标题 */
+    QPushButton  *m_viewSwapBtn;       /* 手动切换两页 */
+    QLabel       *m_monitor;           /* 监看画布 */
+    QLabel       *m_monitorInfo;       /* 监看统计 */
+    QImage        m_monitorImg;        /* 监看图像：灰度，边收边填 */
+    bool          m_monitorActive;     /* 是否正在监看 */
+    int           m_monitorW;
+    int           m_monitorH;
+    int           m_monitorGot;        /* 已收到的点数 */
+    qint64        m_monitorLastPaintMs;/* 重绘节流 */
 
     /* 文件浏览面板 */
     bool           m_fbSaveMode;

@@ -97,9 +97,9 @@ typedef enum state{
 	extern uint8_t RX_number;
 	extern uint8_t RX_data[8][64];
 	extern uint8_t RX_Ctl[8];
-	extern uint8_t RX_write_cusor;
-	extern uint8_t work_cusor;
-	extern uint8_t work_cusor_point;
+	extern uint32_t RX_write_cusor;
+	extern uint32_t work_cusor;
+	extern uint32_t work_cusor_point;
 	extern volatile uint8_t work_cusor_flag;
 	
 	extern uint32_t x_work_orgin;

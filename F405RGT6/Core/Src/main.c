@@ -66,15 +66,15 @@ volatile uint8_t need_send_ctl = 0;   				      /* 1 = 该发控制信号了 */
 uint8_t RX_number = 0;
 uint8_t RX_data[8][64] = {0};
 uint8_t RX_Ctl[8];
-uint8_t RX_write_cusor = 0;
-uint8_t work_cusor = 0;
-uint8_t work_cusor_point = 0;
+uint32_t RX_write_cusor = 0;
+uint32_t work_cusor = 0;
+uint32_t work_cusor_point = 0;
 volatile uint8_t work_cusor_flag = 0;
 
 uint32_t x_work_orgin = 0;
 uint32_t y_work_orgin = 0;
 
-
+uint8_t DataBack[3] = {0x33, 0x00, 0xEE};
 
 /* USER CODE END PV */
 
@@ -178,6 +178,8 @@ int main(void)
 	
 	sys_state = working;
 	
+	RX_write_cusor = 0;
+	
 	
   /* USER CODE END 2 */
 
@@ -248,7 +250,12 @@ int main(void)
         set_delay_time(RX_data[(work_cusor % 8)][work_cusor_point] * LASER_POWER);
 		  
 #endif
-
+		
+		DataBack[1] = RX_data[(work_cusor % 8)][work_cusor_point];
+		
+//		USART3_SendDMA(DataBack, 3);
+		
+		
 		work_cusor_point++;
 		if(work_cusor_point == 64 || work_cusor_flag == 1){
 			work_cusor_flag = 0;

@@ -8,6 +8,66 @@
 #include <QDateTime>
 #include <QVector>
 
+/* ============================ 回传帧（33 gg EE） ============================ */
+
+/**
+ * 组装一条回传帧（3 字节）。仅用于上位机自检 / 模拟发端。
+ * 固件侧请照这个字节序发：0x33 | 灰度 | 0xEE
+ */
+QByteArray SerialIo::buildReportFrame(quint8 gray)
+{
+    QByteArray f;
+    f.reserve(ReportFrameBytes);
+    f.append((char)ReportHead);
+    f.append((char)gray);
+    f.append((char)ReportTail);
+    return f;
+}
+
+/* 把字节串转成 "AA BB CC" 形式的 hex，用于日志 */
+static QString hexOfBytes(const QByteArray &b)
+{
+    QString s;
+    for (int i = 0; i < b.size(); ++i)
+    {
+        if (i) s += QChar(' ');
+        s += QString("%1").arg((quint8)b.at(i), 2, 16, QChar('0')).toUpper();
+    }
+    return s;
+}
+
+int SerialIo::reportCount() const   { return m_reportCount; }
+int SerialIo::reportDropped() const { return m_reportDropped; }
+
+void SerialIo::resetReportStats()
+{
+    m_reportCount   = 0;
+    m_reportDropped = 0;
+}
+
+void SerialIo::setReportWatch(bool on)
+{
+    m_reportWatch = on;
+    if (!on)
+        m_reportCount = m_reportDropped = 0;
+}
+
+bool SerialIo::reportWatch() const { return m_reportWatch; }
+
+/**
+ * 回传异常日志限流。
+ * ★ 必须限流：固件每 3ms 就发一条，一旦格式不对，
+ *   错误日志会以每秒 300 条的速度刷爆界面。
+ */
+bool SerialIo::mayLogReport()
+{
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if ((now - m_lastReportLogMs) < 1000)
+        return false;
+    m_lastReportLogMs = now;
+    return true;
+}
+
 /* ============================ 帧结构常量 ============================ */
 static const quint8  kHead      = 0x55;   /* 帧头 */
 static const quint8  kTail      = 0xAA;   /* 帧尾 */
@@ -74,6 +134,10 @@ SerialIo::SerialIo(QObject *parent) :
     m_rxTotal(0),
     m_firstReqSeen(false),
     m_lastRxLogMs(0),
+    m_reportWatch(true),
+    m_reportCount(0),
+    m_reportDropped(0),
+    m_lastReportLogMs(0),
     m_cfgBaud(115200),
     m_cfgDataBits(8),
     m_cfgParity(ParityNone),     /* 无校验 8N1：与固件实测一致（原按需求配的奇校验是错的） */
@@ -740,68 +804,133 @@ void SerialIo::onReadyRead()
     m_rxTotal += chunk.size();
     emit rxActivity(m_rxTotal);
 
+    /* 记下进入本次解析前的回传计数：
+       后面用来区分"收到的是垃圾"和"收到的只是回传帧" ——
+       回传帧每 3ms 一条，若把它当垃圾报警，日志会被刷爆。 */
+    const int repCountBefore = m_reportCount;
+
     /* ---- 1. 把本次收到的字节并进缓冲 ----
        这是"上位机到底听没听到"的唯一直接证据。
        没有它，用户只能猜：是字节根本没到？还是到了但不匹配？
        两者原因完全不同（前者查接线/端口/波特率，后者查帧格式/校验位）。 */
     m_rxBuf.append(chunk);
 
-    /* ---- 2. 按 3 字节滑动窗找出所有上行帧，并**记住先后顺序** ----
-       三种帧都是 0x55 开头 0xAA 结尾，只差中间字节，所以必须精确匹配 3 字节：
-           0x55 0x44 0xAA   取一包像素数据
-           0x55 0x55 0xAA   取配置
-           0x55 0x10 0xAA   固件上报"接收超时"
+    /* ---- 2. 按**首字节分派**的状态机解析：一个流里混着两种帧 ----
+       ★ 为什么不能再"搜 55 xx AA"（这是本次改动的核心）：
+         固件每画完一个像素就回传一条 3 字节帧 33 gg EE。
+         灰度值 gg 是 0~255 任意值，连发的回传帧**跨帧拼凑**时很容易凑出
+         "55 44 AA" 这种假请求帧；老解析器会在整个缓冲里搜这个序列，
+         一旦命中就当成"取数据请求" → 上位机多发一包 → 握手错乱 → 雕刻中途卡死。
+         （实测：256 个灰度值连发时，老解析器会解出大量假请求帧。）
 
-       ★ 顺序要保留：不能"先把所有 0x44 处理完再处理 0x55" ——
-         固件若连着发「取数据 + 取配置」，颠倒顺序会让它收到错的回应。 */
+         改成"按首字节分派 + 固定长度整体消费"后，两种帧各吃各的，互不干扰：
+             首字节 0x33 → 吃掉 3 字节，按回传帧校验（末字节必须 0xEE）
+             首字节 0x55 → 吃掉 3 字节，按请求帧校验（末字节必须 0xAA）
+
+       ★ 顺序必须保留：固件若连发「取数据 + 取配置」，
+         按到达顺序处理才不会让它收到错的回应。 */
     QVector<quint8> tokens;   /* ReqData / ReqCfg / InitTimeout / Ready */
 
-    while (true)
+    while (!m_rxBuf.isEmpty())
     {
-        const int iData = m_rxBuf.indexOf(reqDataFrame());
-        const int iCfg  = m_rxBuf.indexOf(reqConfigFrame());
-        const int iTmo  = m_rxBuf.indexOf(initTimeoutFrame());
-        const int iRdy  = m_rxBuf.indexOf(readyFrame());
+        const quint8 b0 = (quint8)m_rxBuf.at(0);
 
-        int    i     = -1;
-        quint8 which = 0;
+        /* ---------- 回传帧：0x33 gg 0xEE 共 3 字节 ---------- */
+        if (m_reportWatch && b0 == (quint8)ReportHead)
+        {
+            if (m_rxBuf.size() < ReportFrameBytes)
+                break;                              /* 还没收全，等下一批 */
 
-        /* 取四者中**最靠前**的那个，保持固件发出的先后顺序 */
-        if ((iData >= 0)
-            && ((iCfg < 0) || (iData < iCfg))
-            && ((iTmo < 0) || (iData < iTmo))
-            && ((iRdy < 0) || (iData < iRdy)))
-        {
-            i = iData;  which = (quint8)CtrlReqData;
-        }
-        else if ((iCfg >= 0)
-                 && ((iTmo < 0) || (iCfg < iTmo))
-                 && ((iRdy < 0) || (iCfg < iRdy)))
-        {
-            i = iCfg;   which = (quint8)CtrlReqCfg;
-        }
-        else if ((iTmo >= 0) && ((iRdy < 0) || (iTmo < iRdy)))
-        {
-            i = iTmo;   which = (quint8)CtrlInitTimeout;
-        }
-        else if (iRdy >= 0)
-        {
-            i = iRdy;   which = (quint8)CtrlReady;
+            const quint8 gg = (quint8)m_rxBuf.at(1);
+            const quint8 tt = (quint8)m_rxBuf.at(2);
+
+            if (tt == (quint8)ReportTail)
+            {
+                const int seq = m_reportCount;      /* 第几个到达的点 */
+                ++m_reportCount;
+                emit pixelReported(seq, (int)gg);
+                m_rxBuf.remove(0, ReportFrameBytes);
+                continue;
+            }
+
+            /* 帧尾不对：只丢这 1 个字节，让后面的 0x33 有机会重新对齐 */
+            ++m_reportDropped;
+            if (mayLogReport())
+            {
+                emitLog(QStringLiteral("[!] 回传帧帧尾不对（已丢弃 %1 条）：%2")
+                        .arg(m_reportDropped)
+                        .arg(hexOfBytes(m_rxBuf.left(ReportFrameBytes))));
+            }
+            m_rxBuf.remove(0, 1);
+            continue;
         }
 
-        if (i < 0)
-            break;
+        /* ---------- 请求帧：0x55 xx 0xAA 共 3 字节 ---------- */
+        if (b0 == (quint8)kHead)
+        {
+            if (m_rxBuf.size() < 3)
+                break;                              /* 还不够 3 字节 */
 
-        tokens.append(which);
-        m_rxBuf.remove(0, i + 3);
+            const quint8 b1 = (quint8)m_rxBuf.at(1);
+            const quint8 b2 = (quint8)m_rxBuf.at(2);
+
+            if (b2 == (quint8)kTail)
+            {
+                quint8 which = 0;
+                bool   known = true;
+                if      (b1 == (quint8)CtrlReqData)     which = (quint8)CtrlReqData;
+                else if (b1 == (quint8)CtrlReqCfg)      which = (quint8)CtrlReqCfg;
+                else if (b1 == (quint8)CtrlInitTimeout) which = (quint8)CtrlInitTimeout;
+                else if (b1 == (quint8)CtrlReady)       which = (quint8)CtrlReady;
+                else                                    known = false;
+
+                if (known)
+                {
+                    tokens.append(which);
+                    m_rxBuf.remove(0, 3);
+                }
+                else
+                {
+                    /* 55 xx AA 但 xx 不认识：丢掉这个 0x55，继续往后对齐 */
+                    m_rxBuf.remove(0, 1);
+                }
+                continue;
+            }
+
+            /* 既不是完整请求帧：丢 1 字节重新找帧头 */
+            m_rxBuf.remove(0, 1);
+            continue;
+        }
+
+        /* ---------- 其它字节：丢 1 字节 ---------- */
+        m_rxBuf.remove(0, 1);
     }
 
     const int hit = tokens.size();
 
-    /* 防膨胀：缓冲里剩下的最多只有可能是帧的前缀（<3 字节），
-       超过 3 字节说明收到的是垃圾/下行回显，直接丢掉。 */
-    if (m_rxBuf.size() > 2)
-        m_rxBuf = m_rxBuf.right(2);
+    /* 防膨胀：状态机已经把所有能认的帧都消费掉了，剩下的只可能是
+       "还没收全的帧前缀"（0x33 开头不足 3 字节，或 0x55 开头不足 3 字节）。
+       ★ 不能再粗暴地 right(2) —— 那会把只收了一半的回传帧截断，
+         而回传帧是连续不断的，会被反复截断成垃圾。
+       只在"缓冲异常膨胀"时才清理，且保留最后一个已知帧头之后的部分。 */
+    if (m_rxBuf.size() > 64)
+    {
+        int keepFrom = -1;
+        for (int i = m_rxBuf.size() - 1; i >= 0; --i)
+        {
+            const quint8 c = (quint8)m_rxBuf.at(i);
+            if (c == (quint8)kHead
+                || (m_reportWatch && c == (quint8)ReportHead))
+            {
+                keepFrom = i;
+                break;
+            }
+        }
+        if (keepFrom > 0)
+            m_rxBuf.remove(0, keepFrom);
+        else if (keepFrom < 0)
+            m_rxBuf.clear();
+    }
 
     /* ---- 3. 收到的字节上日志（限流，防止垃圾流刷爆窗口） ---- */
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
@@ -809,8 +938,15 @@ void SerialIo::onReadyRead()
 
     if (hit <= 0)
     {
-        /* ★ 收到东西了、但不是请求帧 —— 这条日志是排查"校验位/波特率不匹配"
-           的第一手证据（那种情况下字节会到，但内容被解错）。 */
+        /* ★ 必须区分两种情况，否则回传数据会被误报成"链路坏了"：
+             (a) 本次收到的确实是垃圾 → 值得报警（排查校验位/波特率不匹配）
+             (b) 本次只收到了回传帧、没有请求帧 → 完全正常，别刷日志
+           判据：回传计数在这次调用里有没有增长。 */
+        if (m_reportCount != repCountBefore)
+            return;                     /* 全是回传帧，正常，不打扰用户 */
+
+        /* 收到东西了、但既不是请求帧也不是回传帧 —— 这条日志是排查
+           "校验位/波特率不匹配"的第一手证据（那种情况下字节会到，但内容被解错）。 */
         if (mayLog)
         {
             m_lastRxLogMs = now;
@@ -820,8 +956,8 @@ void SerialIo::onReadyRead()
                 hex += QString("%1 ").arg((quint8)chunk.at(i), 2, 16, QChar('0')).toUpper();
             if (chunk.size() > n)
                 hex += QStringLiteral("...");
-            emitLog(QStringLiteral("[!] 收到 %1 字节但不是请求帧"
-                                   "（期望 0x55 0x44 0xAA 或 0x55 0x55 0xAA）：%2")
+            emitLog(QStringLiteral("[!] 收到 %1 字节但不是任何已知帧"
+                                   "（期望 0x55 0x44 0xAA / 0x55 0x55 0xAA / 0x33 gg 0xEE）：%2")
                     .arg(chunk.size()).arg(hex.trimmed()));
         }
         return;

@@ -22,6 +22,9 @@
 #include <QGuiApplication>
 #include <QScreen>
 #include <QSerialPortInfo>
+#include <QDateTime>
+#include <QSize>
+#include <QPixmap>
 
 static const int kGrayCutoff = 20;
 
@@ -59,6 +62,12 @@ Widget::Widget(QWidget *parent) :
     m_serTotalPkts = 0;
     m_serRxBytes   = 0;
 
+    m_monitorActive      = false;
+    m_monitorW           = 0;
+    m_monitorH           = 0;
+    m_monitorGot         = 0;
+    m_monitorLastPaintMs = 0;
+
     connect(m_ser, SIGNAL(packetSent(int,int,quint16,int)),
             this, SLOT(onSerialPacketSent(int,int,quint16,int)));
     connect(m_ser, SIGNAL(streamProgress(int,int,int,int)),
@@ -80,6 +89,8 @@ Widget::Widget(QWidget *parent) :
             this, SLOT(onSerialFirmwareReady(int)));
     connect(m_ser, SIGNAL(configRequestReceived(int)),
             this, SLOT(onSerialConfigRequest(int)));
+    connect(m_ser, SIGNAL(pixelReported(int,int)),
+            this, SLOT(onSerialPixelReported(int,int)));
 
     onSerialRefresh();
 
@@ -124,14 +135,49 @@ void Widget::buildUi()
     row1->addWidget(m_srcLabel, 1);
     main->addLayout(row1);
 
-    /* 灰度预览 */
-    m_preview = new QLabel(m_mainPage);
+    /* ============ 预览区：灰度预览 ⇄ 回传监看（同一块地方切换） ============
+       平时显示图纸预览；一开工自动清空并切成监看，实时打出固件回传的点。
+       为什么不做成并排：并排会把两块都挤小，而雕刻时用户关心的是"板子画成什么样"。 */
+    {
+        QHBoxLayout *ph = new QHBoxLayout();
+        m_viewTitle = new QLabel(QStringLiteral("灰度图预览"), m_mainPage);
+        m_viewTitle->setStyleSheet("font-weight: bold;");
+        ph->addWidget(m_viewTitle);
+
+        m_monitorInfo = new QLabel(QStringLiteral("待机"), m_mainPage);
+        m_monitorInfo->setStyleSheet("color: gray;");
+        ph->addWidget(m_monitorInfo, 1);
+
+        m_viewSwapBtn = new QPushButton(QStringLiteral("切到回传监看"), m_mainPage);
+        connect(m_viewSwapBtn, SIGNAL(clicked()), this, SLOT(onViewSwap()));
+        ph->addWidget(m_viewSwapBtn);
+
+        main->addLayout(ph);
+    }
+
+    m_viewStack = new QStackedWidget(m_mainPage);
+
+    /* 第 0 页：灰度预览 */
+    m_preview = new QLabel(m_viewStack);
     m_preview->setMinimumSize(320, 200);
     m_preview->setAlignment(Qt::AlignCenter);
     m_preview->setFrameShape(QFrame::Box);
     m_preview->setText(QStringLiteral("灰度图预览"));
     m_preview->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
-    main->addWidget(m_preview, 1);
+    m_viewStack->addWidget(m_preview);
+
+    /* 第 1 页：回传监看（开工后清空，按固件回传的数据实时打点） */
+    m_monitor = new QLabel(m_viewStack);
+    m_monitor->setMinimumSize(320, 200);
+    m_monitor->setAlignment(Qt::AlignCenter);
+    m_monitor->setFrameShape(QFrame::Box);
+    m_monitor->setStyleSheet("background:#101010; color:#888;");
+    m_monitor->setText(QStringLiteral("开工后这里会清空，并实时打出固件回传的每一个点\n"
+                                      "（固件每画完一个像素发一条 0x33 灰度 0xEE）"));
+    m_monitor->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
+    m_viewStack->addWidget(m_monitor);
+
+    main->addWidget(m_viewStack, 1);
 
     /* 目标尺寸 + 极性说明 */
     QGridLayout *grid = new QGridLayout();
@@ -449,6 +495,176 @@ void Widget::buildUi()
 
     m_fbSaveMode = false;
     m_pendingGrayLines.clear();
+}
+
+/* ====================== 雕刻回传监看 ====================== */
+
+void Widget::showViewPage(int page)
+{
+    if (!m_viewStack)
+        return;
+    m_viewStack->setCurrentIndex(page);
+    updateViewSwapBtn();
+
+    if (page == 1)
+    {
+        m_viewTitle->setText(QStringLiteral("雕刻回传监看（固件实画）"));
+        m_viewTitle->setStyleSheet("font-weight: bold; color: #060;");
+        monitorRepaint();
+    }
+    else
+    {
+        m_viewTitle->setText(QStringLiteral("灰度图预览"));
+        m_viewTitle->setStyleSheet("font-weight: bold;");
+        updatePreview();
+    }
+}
+
+void Widget::updateViewSwapBtn()
+{
+    if (!m_viewSwapBtn || !m_viewStack)
+        return;
+    const bool onMonitor = (m_viewStack->currentIndex() == 1);
+    m_viewSwapBtn->setText(onMonitor ? QStringLiteral("切到灰度预览")
+                                     : QStringLiteral("切到回传监看"));
+}
+
+void Widget::onViewSwap()
+{
+    if (!m_viewStack)
+        return;
+    showViewPage(m_viewStack->currentIndex() == 1 ? 0 : 1);
+}
+
+/**
+ * 开工：**清空画布**并立刻切到监看页（灰度预览让位）。
+ * 清空后画布是全黑的，固件回传的点会一个个点亮上去。
+ */
+void Widget::monitorBegin(int w, int h)
+{
+    if ((w <= 0) || (h <= 0))
+        return;
+
+    m_monitorW = w;
+    m_monitorH = h;
+    m_monitorGot = 0;
+    m_monitorActive = true;
+    m_monitorLastPaintMs = 0;
+
+    /* 黑底 = "还没画到"。收到的点按灰度点亮，
+       这样"画到哪了、哪里还空着"一眼可见。 */
+    m_monitorImg = QImage(w, h, QImage::Format_Grayscale8);
+    m_monitorImg.fill(0);
+
+    m_monitor->setText(QString());
+    showViewPage(1);
+
+    m_monitorInfo->setText(QStringLiteral("监看中… 0 / %1 点").arg((qint64)w * h));
+    m_monitorInfo->setStyleSheet("color: #060;");
+
+    if (m_ser)
+        m_ser->resetReportStats();
+}
+
+/**
+ * 收到一个像素：**按到达顺序**依次落在画布上。
+ *
+ * ★ 固件回传帧里不带坐标（只有 33 gg EE 三个字节），所以本来就只能按顺序落。
+ *   而这恰好是最好的监控视角 —— 画出来的就是固件**实际的输出顺序**：
+ *     · 正常       → 逐行从左到右铺满，最后和图纸一致
+ *     · 重复某行   → 画面上出现重复的横带
+ *     · 跳过某行   → 出现空洞
+ *     · 一行画两遍 → 出现半行错位
+ *   不用等刻完拿尺子量，屏幕上直接看。
+ */
+void Widget::monitorFeed(int gray)
+{
+    if (!m_monitorActive || m_monitorImg.isNull())
+        return;
+
+    const qint64 total = (qint64)m_monitorW * m_monitorH;
+    const int seq = m_monitorGot;              /* 第几个到达 */
+    ++m_monitorGot;
+
+    if (seq >= total)
+        return;                                /* 超出画布：固件多发了 */
+
+    const int y = seq / m_monitorW;
+    const int x = seq % m_monitorW;
+
+    uchar *row = m_monitorImg.scanLine(y);
+    row[x] = (uchar)qBound(0, gray, 255);
+
+    /* 重绘节流：每 40ms 刷一次。
+       ★ 必须节流：固件一个点约 3ms，不节流会每秒重绘 300 次，界面卡死。 */
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if ((now - m_monitorLastPaintMs) >= 40)
+    {
+        m_monitorLastPaintMs = now;
+        monitorRepaint();
+        m_monitorInfo->setText(QStringLiteral("监看中… %1 / %2 点  (%3%)")
+            .arg(m_monitorGot).arg(total)
+            .arg(total > 0 ? (int)(100.0 * m_monitorGot / total) : 0));
+    }
+
+    /* 全部点到齐 → 自动收尾 */
+    if (m_monitorGot >= total)
+        monitorEnd(false);
+}
+
+void Widget::monitorEnd(bool aborted)
+{
+    if (!m_monitorActive)
+        return;
+
+    m_monitorActive = false;
+    monitorRepaint();
+
+    const qint64 total = (qint64)m_monitorW * m_monitorH;
+    QString txt = QStringLiteral("%1  %2 / %3 点 (%4%)")
+                    .arg(aborted ? QStringLiteral("已中止") : QStringLiteral("监看结束"))
+                    .arg(m_monitorGot).arg(total)
+                    .arg(total > 0 ? (int)(100.0 * m_monitorGot / total) : 0);
+
+    if (m_monitorGot < total)
+        txt += QStringLiteral("   ⚠ 少了 %1 点（固件没画完）").arg(total - m_monitorGot);
+    else if (m_monitorGot > total)
+        txt += QStringLiteral("   ⚠ 多了 %1 点（固件多画了）").arg(m_monitorGot - total);
+
+    if (m_ser)
+        txt += QStringLiteral("   回传帧 %1 条 / 丢弃 %2 条")
+               .arg(m_ser->reportCount()).arg(m_ser->reportDropped());
+
+    m_monitorInfo->setText(txt);
+    const bool bad = (m_monitorGot != total)
+                  || (m_ser && m_ser->reportDropped() > 0);
+    m_monitorInfo->setStyleSheet(bad ? "color: #c00;" : "color: #060;");
+}
+
+/** 把监看图画到界面上（等比缩放，最近邻保持像素感） */
+void Widget::monitorRepaint()
+{
+    if (m_monitorImg.isNull() || !m_monitor)
+        return;
+
+    const QSize sz = m_monitor->size();
+    if (sz.width() < 8 || sz.height() < 8)
+        return;
+
+    QSize fit = m_monitorImg.size();
+    fit.scale(sz, Qt::KeepAspectRatio);
+    if (fit.width()  < 1) fit.setWidth(1);
+    if (fit.height() < 1) fit.setHeight(1);
+
+    /* 放大用 FastTransformation：监看要看清单个像素，不要平滑 */
+    m_monitor->setPixmap(QPixmap::fromImage(
+        m_monitorImg.scaled(fit, Qt::IgnoreAspectRatio, Qt::FastTransformation)));
+}
+
+void Widget::onSerialPixelReported(int seq, int gray)
+{
+    Q_UNUSED(seq);          /* 序号仅用于统计，落点用"到达顺序"即可 */
+    monitorFeed(gray);
 }
 
 /* ====================== 串口下发 ====================== */
@@ -877,6 +1093,9 @@ void Widget::onSerialSend()
     m_serOpenBtn->setEnabled(false);
     m_serClock.start();
 
+    /* ★ 进入雕刻：清空监看画布并切到监看页，开始接收固件回传的每一个像素 */
+    monitorBegin(w, h);
+
     /* 用 beginImage + 逐行 feedRow：每行之间回一次事件循环，进度条才动得起来。
        倒序（弓字形）在 SerialIo 内部按行号判定，这里只负责给原始行。 */
     m_ser->beginImage(w, h, m_bidiBox->isChecked());
@@ -965,6 +1184,8 @@ void Widget::onSerialFinished(bool aborted)
     {
         m_serBar->setFormat(QStringLiteral("已中止"));
         setStatus(QStringLiteral("下发已中止"), false);
+        /* 中止：固件不会再画了，收尾监看 */
+        monitorEnd(true);
         return;
     }
     m_serBar->setValue(m_serBar->maximum());
@@ -1070,6 +1291,11 @@ void Widget::refreshGray()
        载入新图后自动同步一次，省得用户手动填、填错导致固件按错的尺寸摆点。 */
     m_cfgXSpin->setValue(w);
     m_cfgYSpin->setValue(h);
+
+    /* ★ 换了新图纸就切回预览页：否则看到的还是上一幅的监看画面，
+       会误以为"新图已经画上去了"或"图纸没换"。 */
+    if (!m_monitorActive)
+        showViewPage(0);
 
     updatePreview();
     setStatus(QStringLiteral("灰度图已就绪：%1 x %2 点").arg(w).arg(h), true);
