@@ -178,9 +178,6 @@ int main(void)
 	
 	sys_state = working;
 	
-	for(int i = 0; i < 8; i++){
-	  USART3_SendDMA(RX_data[i],64);
-	}
 	
   /* USER CODE END 2 */
 
@@ -192,15 +189,9 @@ int main(void)
 	if((work_cusor > RX_write_cusor) && (req_pending == 0)){
 	  RX_number = 0;
 	  USART3_RxStart();
-	  USART3_SendDMA(RX_data[((RX_write_cusor - 1) % 8)],64);
 	  Send_Next();
       req_sent_ms = HAL_GetTick();
       req_pending = 1;
-	}else{
-		OLED_Clear();
-        char program_end[] = {"cusor error!!!"};
-        OLED_ShowString(0, 0, program_end, OLED_FONT_08, 1);
-        OLED_Refresh();
 	}
 		
       RX_number = USART3_RxPoll();
