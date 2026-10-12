@@ -113,3 +113,4 @@ gray_image.h
 Thumbs.db
 Desktop.ini
 .DS_Store
+.build-verify/
