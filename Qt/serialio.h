@@ -170,6 +170,37 @@ public:
     void setReportWatch(bool on);
     bool reportWatch() const;
 
+    /* ==================== 回显驱动补货（新流控方式）====================
+       传统方式：固件发 55 44 AA 要一个 → 上位机回一个。
+           问题：回显帧(33 gg EE, 每像素一条)和请求帧(55 44 AA)共用同一个
+                 USART3 TX DMA，而 USART3_SendDMA() 里有
+                 `hdma_usart3_tx.State = HAL_DMA_STATE_READY;` 强制复位，
+                 会就地重配正在传输的 DMA → 请求帧被截断成 "55 33 gg EE"
+                 → 上位机永远等不到完整请求 → 链路死掉。
+
+       新方式：**固件彻底不再发 55 44 AA**，只发回显；
+               上位机数回显，每收满一包对应的点数(默认 64)就主动补一包。
+           好处：上行只剩一种帧，彻底不存在"回显打断控制帧"的冲突；
+                 而且回显速率天然等于雕刻速率，是天然的背压信号。
+
+       ⚠ 必须预填充：固件不再开口要，上位机就得先主动喂几包，
+         否则固件缓冲区是空的，一上来就读陈旧数据。
+         预填充 2 包即可（1 包正在雕 + 1 包备用），见 sendStart()。 */
+    void setEchoDriven(bool on);
+    bool echoDriven() const;
+
+    /* 每收到多少条回显补一包。默认 64 = 一包恰好 64 个像素点。
+       若固件一包不是 64 点，改这里即可，不用动解析逻辑。 */
+    void setEchoPerPacket(int n);
+    int  echoPerPacket() const;
+
+    /* 启动时主动预填充几包。默认 2。
+       ★ 不能设 0：固件不再请求，预填充 0 会让它饿死。
+       ★ 也不能太大：固件 RX 缓冲只有 8 包深(见固件 RX_data[8][64])，
+         预填充超过 8 会直接把未消费的包覆盖掉。 */
+    void setPrefillCount(int n);
+    int  prefillCount() const;
+
     /* 组装一条回传帧（用于上位机自检 / 模拟发端） */
     static QByteArray buildReportFrame(quint8 gray);
 
@@ -348,6 +379,8 @@ private slots:
     void onBytesWritten(qint64 n);
     void onReadyRead();
     void onHandshakeTimeout();
+    /* 延迟执行的预填充（避开固件处理 55 66 AA 时 abort RX 的窗口） */
+    void onPrefillTimeout();
 
 private:
     QByteArray buildPacket(quint8 ctrl, const QByteArray &pixels64) const;
@@ -366,6 +399,11 @@ private:
     bool writeConfigPacket();
     /* 回传异常日志限流（回传帧连续不断，格式错会刷屏） */
     bool mayLogReport();
+    /* ---- 回显驱动补货 ---- */
+    /* 回显计数跨过一包的点数时补一包；内部按"已补货计数"做增量，不会重复补 */
+    void maybePumpByEcho();
+    /* 启动时主动预填充几包（固件不再开口要，必须由上位机先喂） */
+    void prefillPackets();
 
     QSerialPort *m_port;
     QTimer      *m_timer;
@@ -402,6 +440,23 @@ private:
     int          m_reportCount;
     int          m_reportDropped;
     int          m_lastReportLogMs;
+
+    /* ---- 回显驱动补货（替代"固件发 55 44 AA 要数据"）---- */
+    bool         m_echoDriven;      /* true = 数回显补货，不再等 55 44 AA */
+    int          m_echoPerPacket;   /* 退化情况下的兜底值（拿不到行信息时用），默认 64 */
+    int          m_prefillCount;    /* 启动预填充包数，默认 2 */
+    int          m_pumpedReports;   /* 上次补货时的回显计数增量基准 */
+
+    /* ★ 按「行」精确补货 —— 修掉"固定 64 条补一包"的亏空
+       固件不是每包固定消耗 64 像素：行末那一包它只画 (width % 64) 个点就换行，
+       剩余像素直接跳过去、不发回传帧。所以「回传帧数 ÷ 64」永远小于实际包数，
+       图越窄亏得越狠（474 亏 7.4%，200 亏 21.9%），缓冲区很快被耗光 → 画面全白。
+
+       正确换算：固件画完一整行(发 width 条回传帧) == 消耗 pktsPerRow 包。
+       用累加器做整数运算，避免浮点误差累积。 */
+    int          m_rowPixels;       /* 一行的像素数（= 图片宽度） */
+    int          m_rowPackets;      /* 一行占几个包 = ceil(width/64) */
+    int          m_echoAccum;       /* 累加器：≥ m_rowPixels 就补一包 */
 
     /* 串口参数（默认按需求：115200 / 8 / 奇 / 1） */
     int          m_cfgBaud;

@@ -59,7 +59,7 @@ conformation x, y;
 volatile state sys_state;
 uint8_t* alarm;
 
-uint8_t ctrl_req[3] = {0x55, 0x44, 0xAA};   			  /* 换成你的 3 字节内容 */
+uint8_t ctrl_req[3] = {0x55, 0x44, 0xAA};   			 /* 换成你的 3 字节内容 */
 uint8_t req_pending = 0;                          	/* 1 = 已发出，等 67 字节回包 */
 uint32_t req_sent_ms = 0;
 volatile uint8_t need_send_ctl = 0;   				      /* 1 = 该发控制信号了 */
@@ -75,6 +75,7 @@ uint32_t x_work_orgin = 0;
 uint32_t y_work_orgin = 0;
 
 uint8_t DataBack[3] = {0x33, 0x00, 0xEE};
+uint8_t UART_Idle = 0;
 
 /* USER CODE END PV */
 
@@ -164,6 +165,7 @@ int main(void)
 	OLED_ShowNum(0,32,x.all_point,OLED_FONT_08, 1);
     OLED_Refresh();
 	waiting();
+	USART3_RxStart();
 	goto_point(x_work_orgin,y_work_orgin);
 	x.cur_point = 0;
 	y.cur_point = 0;
@@ -188,14 +190,7 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-	if((work_cusor > RX_write_cusor) && (req_pending == 0)){
-	  RX_number = 0;
-	  USART3_RxStart();
-	  Send_Next();
-      req_sent_ms = HAL_GetTick();
-      req_pending = 1;
-	}
-		
+
       RX_number = USART3_RxPoll();
       if(RX_number == USART3_CMD_BUF_SIZE){
 		if(usart3_cmd_buf[0] == 0x55 && usart3_cmd_buf[68] == 0xAA){
@@ -204,14 +199,9 @@ int main(void)
 			usart3_cmd_buf[68] = 0x00;
 			RX_Ctl[(RX_write_cusor % 8)] = usart3_cmd_buf[1];
 			RX_write_cusor++;
-			req_pending = 0;
 		}
+	    RX_number = 0;
 		USART3_RxStart();
-      }
-      if (req_pending && ((HAL_GetTick() - req_sent_ms) > REPLY_TIMEOUT_MS))
-      {
-          req_pending = 0;
-		  Send_USART_TIMEOUT();
       }
 	  
       if(y.cur_point >= y.all_point){
@@ -233,7 +223,7 @@ int main(void)
 		  
 #if TIME_DELAY
 		  
-        alarm = Creat_alarm(RX_data[work_cusor][work_cusor_point] * LASER_POWER);
+        alarm = Creat_alarm(RX_data[work_cusor % 8][work_cusor_point] * LASER_POWER);
         if(alarm == NULL){
             HAL_TIM_Base_Stop_IT(&htim2);
 			OLED_Clear();
@@ -252,8 +242,9 @@ int main(void)
 #endif
 		
 		DataBack[1] = RX_data[(work_cusor % 8)][work_cusor_point];
-		
-//		USART3_SendDMA(DataBack, 3);
+		if(UART_Idle == 0){
+			USART3_SendDMA(DataBack, 3);
+		}
 		
 		
 		work_cusor_point++;

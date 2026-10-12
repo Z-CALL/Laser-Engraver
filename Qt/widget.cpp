@@ -26,7 +26,9 @@
 #include <QSize>
 #include <QPixmap>
 
-static const int kGrayCutoff = 20;
+/* 背景截断阈值的默认值（界面上可调，这个只是初值）。
+   见 buildUi() 里 m_grayCutSpin 的注释：小尺寸图建议调小甚至调 0。 */
+static const int kGrayCutoffDefault = 20;
 
 /* SerialIo 的日志回调 -> 回到 Widget::logMsg（回调在 GUI 线程内被调用，直接操作控件是安全的） */
 static void serialLogTrampoline(void *ctx, const QString &line)
@@ -171,9 +173,10 @@ void Widget::buildUi()
     m_monitor->setMinimumSize(320, 200);
     m_monitor->setAlignment(Qt::AlignCenter);
     m_monitor->setFrameShape(QFrame::Box);
-    m_monitor->setStyleSheet("background:#101010; color:#888;");
-    m_monitor->setText(QStringLiteral("开工后这里会清空，并实时打出固件回传的每一个点\n"
-                                      "（固件每画完一个像素发一条 0x33 灰度 0xEE）"));
+    /* 白底：和"白纸 + 烧黑"的实物观感一致 */
+    m_monitor->setStyleSheet("background:#ffffff; color:#888;");
+    m_monitor->setText(QStringLiteral("开工后这里会清空成白纸，并实时打出固件回传的每一个点\n"
+                                      "（固件每画完一个像素发一条 0x33 灰度 0xEE，烧过的地方显黑）"));
     m_monitor->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
     m_viewStack->addWidget(m_monitor);
 
@@ -222,6 +225,29 @@ void Widget::buildUi()
     m_grayHiSpin->setRange(0, 255);
     m_grayHiSpin->setValue(255);
     grid2->addWidget(m_grayHiSpin, 1, 3);
+
+    /* ★ 背景截断阈值（雕刻用）—— 原先是硬编码常量 kGrayCutoff=20，没法调。
+       含义：反相后的出光强度 val = 255 - 灰度，
+             val < 阈值 的点一律归 0（不出光），用来去掉背景灰底。
+
+       ★ 为什么必须能调（"小图雕出来全白"的头号嫌疑）：
+         源图缩放到小尺寸(比如 200x200)时用的是 SmoothTransformation，
+         细线条会被**平滑平均**掉，整体灰度变浅；
+         此时 255-灰度 很容易落到 20 以下 → 被整片归零 → 激光几乎不出光 → 全白。
+         而 474 那种大尺寸细节保留得多，就不会触发。
+       调到大值 = 更狠地抠背景；调到 0 = 完全不截断（连白底一起烧）。 */
+    m_grayCutSpin = new QSpinBox(m_mainPage);
+    m_grayCutSpin->setRange(0, 255);
+    m_grayCutSpin->setValue(kGrayCutoffDefault);
+    m_grayCutSpin->setToolTip(QStringLiteral(
+        "出光强度低于此值的点归零(不出光)。\n"
+        "雕刻出来太白/太淡 → 调小这个数(甚至 0)；\n"
+        "背景脏、白底也被烧 → 调大。\n"
+        "小尺寸图因为缩放平滑会整体变淡，通常需要调小。"));
+    grid2->addWidget(new QLabel(QStringLiteral("背景截断阈值"), m_mainPage), 2, 0);
+    grid2->addWidget(m_grayCutSpin, 2, 1);
+    connect(m_grayCutSpin, SIGNAL(valueChanged(int)), this, SLOT(refreshGray()));
+
     main->addLayout(grid2);
 
     /* 导出灰度 C 数组 */
@@ -551,10 +577,12 @@ void Widget::monitorBegin(int w, int h)
     m_monitorActive = true;
     m_monitorLastPaintMs = 0;
 
-    /* 黑底 = "还没画到"。收到的点按灰度点亮，
-       这样"画到哪了、哪里还空着"一眼可见。 */
+    /* ★ 白底 = "还没画到"（对应白纸），收到的点按灰度烧黑 —— 和实物观感一致。
+       注意极性：固件回传的灰度值是"出光强度"（0 = 不出光 = 白纸，255 = 满功率 = 烧黑），
+       所以写画布时要写 (255 - gray)，这样出光强的地方才显示为黑点。
+       这和灰度预览的显示约定保持一致（深色 = 会烧的地方）。 */
     m_monitorImg = QImage(w, h, QImage::Format_Grayscale8);
-    m_monitorImg.fill(0);
+    m_monitorImg.fill(255);
 
     m_monitor->setText(QString());
     showViewPage(1);
@@ -590,10 +618,22 @@ void Widget::monitorFeed(int gray)
         return;                                /* 超出画布：固件多发了 */
 
     const int y = seq / m_monitorW;
-    const int x = seq % m_monitorW;
+    int x = seq % m_monitorW;
 
+    /* ★ 弓字形校正：奇数行固件是反向走的（右→左），回传顺序也是反的。
+       若按到达顺序直接从左往右画，奇数行会整体左右镜像 ——
+       对有朝向细节的图案（龙爪、龙须、文字）会产生"编织/拉花"般的碎条纹，
+       这就是监看画面看起来被剪碎的原因。这里把奇数行画回图纸方向。 */
+    if (m_bidiBox->isChecked() && ((y & 1) != 0))
+        x = m_monitorW - 1 - x;
+
+    /* ★ 极性：固件回传的 gray 是"出光强度"（0=不出光=白纸，255=满功率=烧黑）。
+       画布是白底（未画过 = 白纸），所以这里要写 (255 - gray)：
+         收到 gray=255（满功率）→ 画布写 0   → 显示黑点 ✅
+         收到 gray=0  （不出光）→ 画布写 255 → 显示白   ✅
+       这样监看画面和实物观感一致：烧过的地方是黑的。 */
     uchar *row = m_monitorImg.scanLine(y);
-    row[x] = (uchar)qBound(0, gray, 255);
+    row[x] = (uchar)(255 - qBound(0, gray, 255));
 
     /* 重绘节流：每 40ms 刷一次。
        ★ 必须节流：固件一个点约 3ms，不节流会每秒重绘 300 次，界面卡死。 */
@@ -602,9 +642,12 @@ void Widget::monitorFeed(int gray)
     {
         m_monitorLastPaintMs = now;
         monitorRepaint();
-        m_monitorInfo->setText(QStringLiteral("监看中… %1 / %2 点  (%3%)")
+        /* 状态栏同时显示"画到第几行"，比单纯的点数直观 ——
+           卡住时能直接看出停在第几行。 */
+        m_monitorInfo->setText(QStringLiteral("监看中… %1 / %2 点 (%3%)   第 %4 / %5 行")
             .arg(m_monitorGot).arg(total)
-            .arg(total > 0 ? (int)(100.0 * m_monitorGot / total) : 0));
+            .arg(total > 0 ? (int)(100.0 * m_monitorGot / total) : 0)
+            .arg(y + 1).arg(m_monitorH));
     }
 
     /* 全部点到齐 → 自动收尾 */
@@ -1270,6 +1313,13 @@ void Widget::refreshGray()
     QImage data(gray.size(), QImage::Format_Grayscale8);
     QImage view(gray.size(), QImage::Format_Grayscale8);
 
+    /* ★ 截断阈值取界面上的值（原来写死为常量 20，小图雕白时没法救） */
+    const int cut = m_grayCutSpin ? m_grayCutSpin->value() : kGrayCutoffDefault;
+
+    /* 顺便统计一下被砍掉多少 —— 这是"为什么雕出来是白的"最直接的证据 */
+    int nZero = 0;
+    const int total = gray.width() * gray.height();
+
     for (int y = 0; y < gray.height(); ++y)
     {
         const uchar *src = gray.constScanLine(y);
@@ -1278,7 +1328,8 @@ void Widget::refreshGray()
         for (int x = 0; x < gray.width(); ++x)
         {
             int val = 255 - (int)src[x];
-            if (val < kGrayCutoff) { val = 0; }
+            if (val < cut) { val = 0; }
+            if (val == 0) { ++nZero; }
             dat[x] = (uchar)val;
             pvw[x] = (uchar)(255 - val);
         }
@@ -1298,7 +1349,30 @@ void Widget::refreshGray()
         showViewPage(0);
 
     updatePreview();
-    setStatus(QStringLiteral("灰度图已就绪：%1 x %2 点").arg(w).arg(h), true);
+
+    /* ★ 把"有多少点被归零"直接报出来 —— 雕刻出来全白时，一眼就能看出
+         是数据本身被砍光了（阈值问题），还是数据没送到固件（链路问题）。 */
+    if (total > 0)
+    {
+        const double pct = 100.0 * (double)nZero / (double)total;
+        QString warn;
+        if (pct > 95.0)
+        {
+            warn = QStringLiteral(
+                " ⚠ 几乎全被截断(%1%)，雕刻出来会是空白！请把「背景截断阈值」调小(可试 0)");
+        }
+        else if (pct > 80.0)
+        {
+            warn = QStringLiteral(" （偏淡：%1% 的点不出光，可考虑调小阈值）");
+        }
+        setStatus(QStringLiteral("灰度图已就绪：%1 x %2 点，不出光的点占 %3%%4")
+                  .arg(w).arg(h).arg(pct, 0, 'f', 1).arg(warn.arg(pct, 0, 'f', 1)),
+                  pct <= 95.0);
+    }
+    else
+    {
+        setStatus(QStringLiteral("灰度图已就绪：%1 x %2 点").arg(w).arg(h), true);
+    }
 }
 
 void Widget::updatePreview()
@@ -1347,7 +1421,8 @@ QStringList Widget::buildGrayArrayLines() const
     out << QStringLiteral(" * 尺寸    : %1 x %2  (宽 %1 点/行, 高 %2 行)").arg(w).arg(h);
     out << QStringLiteral(" * 取值    : 0~255");
     out << QStringLiteral(" * 极性    : 黑=255, 白=0 (已反相, 固定)");
-    out << QStringLiteral(" * 低灰度  : 灰度值 < %1 的已归零(去背景灰底)").arg(kGrayCutoff);
+    out << QStringLiteral(" * 低灰度  : 出光强度 < %1 的已归零(去背景灰底)")
+               .arg(m_grayCutSpin ? m_grayCutSpin->value() : kGrayCutoffDefault);
     out << QStringLiteral(" * 排列    : %1").arg(bidi
                                     ? QStringLiteral("弓字形(奇数行倒序) —— 与运动顺序一致")
                                     : QStringLiteral("自然行序(每行都从左到右)"));
@@ -1445,7 +1520,7 @@ void Widget::onSaveGrayArray()
                     ? QStringLiteral("%1~%2").arg(m_grayLoSpin->value())
                                             .arg(m_grayHiSpin->value())
                     : QStringLiteral("无(原值)"))
-           .arg(kGrayCutoff), true);
+           .arg(m_grayCutSpin ? m_grayCutSpin->value() : kGrayCutoffDefault), true);
 
     m_pendingGrayLines = buildGrayArrayLines();
 

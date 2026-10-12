@@ -43,6 +43,8 @@ void SerialIo::resetReportStats()
 {
     m_reportCount   = 0;
     m_reportDropped = 0;
+    m_pumpedReports = 0;   /* 补货基准跟着一起归零，否则换图后会少补 */
+    m_echoAccum     = 0;   /* 累加器也要归零 */
 }
 
 void SerialIo::setReportWatch(bool on)
@@ -53,6 +55,148 @@ void SerialIo::setReportWatch(bool on)
 }
 
 bool SerialIo::reportWatch() const { return m_reportWatch; }
+
+/* ==================== 回显驱动补货 ==================== */
+
+void SerialIo::setEchoDriven(bool on)
+{
+    if (m_echoDriven == on)
+        return;
+    m_echoDriven = on;
+    emitLog(on
+        ? QStringLiteral("[>] 流控方式：回显驱动（固件不再发 55 44 AA，"
+                         "上位机每收满 %1 条回显补一包）").arg(m_echoPerPacket)
+        : QStringLiteral("[>] 流控方式：请求驱动（等固件发 55 44 AA，来一个发一包）"));
+}
+
+bool SerialIo::echoDriven() const { return m_echoDriven; }
+
+void SerialIo::setEchoPerPacket(int n)
+{
+    if (n <= 0)
+        n = 1;
+    m_echoPerPacket = n;
+}
+
+int SerialIo::echoPerPacket() const { return m_echoPerPacket; }
+
+void SerialIo::setPrefillCount(int n)
+{
+    /* 下限 1：固件不再开口要数据，预填充 0 会让它一上来就饿死。
+       上限 8：固件侧 RX_data 只有 8 包深，再多会把未消费的包覆盖掉。 */
+    if (n < 1) n = 1;
+    if (n > 8) n = 8;
+    m_prefillCount = n;
+}
+
+int SerialIo::prefillCount() const { return m_prefillCount; }
+
+/**
+ * 启动时主动预填充若干包。
+ *
+ * ★ 为什么必须有这一步：固件不再发 55 44 AA，它就再也不会"开口要"。
+ *   如果上位机也不主动喂，固件一进主循环缓冲区是空的，
+ *   只能拿 RX_data 里的陈旧数据去雕 —— 画面从第一行就是错的。
+ *
+ * ★ 为什么默认 2 包而不是 1 包：
+ *     1 包 = 雕第 N 包时手上只有第 N 包，一旦串口有抖动就没余量；
+ *     2 包 = 雕第 N 包时第 N+1 包已在手，能容忍一包的传输抖动。
+ *   再往上加收益递减，且逼近固件 8 包缓冲上限，所以默认就 2。
+ */
+void SerialIo::prefillPackets()
+{
+    int sent = 0;
+    for (int i = 0; i < m_prefillCount; ++i)
+    {
+        if (m_queue.isEmpty())
+            break;
+        if (!pumpOne())
+            break;
+        ++sent;
+    }
+
+    /* 预填充也算"已补货"，把基准推到当前回显数，避免刚启动就重复补 */
+    m_pumpedReports = m_reportCount;
+
+    if (sent > 0)
+    {
+        emitLog(QStringLiteral("[>] 回显驱动：预填充 %1 包（固件不再发 55 44 AA，"
+                               "之后每收满 %2 条回显补 1 包）")
+                .arg(sent).arg(m_echoPerPacket));
+    }
+    else
+    {
+        emitLog(QStringLiteral("[!] 回显驱动：预填充失败，队列是空的"
+                               "（没点「发送整幅图」装载数据？）"));
+    }
+
+    /* 起超时哨兵：等固件吐回显。雕刻一包约 64×3ms ≈ 192ms，
+       远小于默认 3000ms 的窗口，正常情况下不会误报。 */
+    if (m_hsTimeoutMs > 0 && !m_queue.isEmpty())
+        m_hsTimer->start(m_hsTimeoutMs);
+}
+
+/**
+ * 回显计数跨过"一包的点数"就补一包。
+ *
+ * ★ 用增量基准(m_pumpedReports)而不是取模，是为了抗丢帧：
+ *   万一串口丢了几条回显，取模会永久错位；用"当前计数 - 上次补货计数"
+ *   则下一包收到时会自动补上，不会累积漂移。
+ */
+void SerialIo::maybePumpByEcho()
+{
+    if (!m_echoDriven)
+        return;
+    if (m_mode != ModeHandshake)
+        return;
+    if (m_queue.isEmpty())
+        return;
+
+    /* 本次新增了多少条回传帧 */
+    const int newReports = m_reportCount - m_pumpedReports;
+    if (newReports <= 0)
+        return;
+    m_pumpedReports = m_reportCount;      /* 基准推进 */
+
+    /* ★★ 精确换算（本次修掉的核心 bug）
+         固件画完一整行 = 发 m_rowPixels 条回传帧 = 消耗 m_rowPackets 包。
+         所以每来一条回传帧就累加 m_rowPackets，攒够 m_rowPixels 补一包。
+
+         对比「固定每 64 条补 1 包」的旧算法：
+           474 宽：实际每行需 8 包，旧法只补 7.4  → 每行亏 0.6，亏空  7.4%
+           200 宽：实际每行需 4 包，旧法只补 3.1  → 每行亏 0.9，亏空 21.9%
+         缓冲区只有 8 包深，200 的图不到 10 行就饿死 → 读到陈旧数据 → 全白。 */
+    const int perRowPixels  = (m_rowPixels  > 0) ? m_rowPixels  : m_echoPerPacket;
+    const int perRowPackets = (m_rowPackets > 0) ? m_rowPackets : 1;
+
+    m_echoAccum += newReports * perRowPackets;
+
+    while (m_echoAccum >= perRowPixels)
+    {
+        if (m_queue.isEmpty())
+            break;
+        if (!pumpOne())
+            break;
+        m_echoAccum -= perRowPixels;
+        ++m_hsSent;
+
+        /* 补货路径 (b)：按实际行数补货。
+           ★ 限流：雕刻时这条每秒会走几次，不限流会刷爆日志窗口。 */
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        if ((now - m_lastRxLogMs) > 500)
+        {
+            m_lastRxLogMs = now;
+            emitLog(QStringLiteral("[>] 回传帧累计到一行(%1 条) → 补 %2 包"
+                                   "（路径 b：回显计数；已收 %3 条，已发 %4 / %5 包）")
+                    .arg(perRowPixels).arg(perRowPackets)
+                    .arg(m_reportCount).arg(m_sentPkts).arg(m_totalPkts));
+        }
+    }
+
+    /* 续上哨兵：继续等下一批回显 */
+    if (!m_queue.isEmpty() && (m_hsTimeoutMs > 0))
+        m_hsTimer->start(m_hsTimeoutMs);
+}
 
 /**
  * 回传异常日志限流。
@@ -112,6 +256,12 @@ static quint16 crc16CcittFalse(const QByteArray &data)
 /* 握手超时默认值：等 3 秒还没来 0x44 就认为固件跑了/断了 */
 static const int     kDefaultHsTimeoutMs = 3000;
 
+/* 发完启动命令(55 66 AA)后，隔多久再预填充。
+   ★ 不能为 0：固件处理 55 66 AA 时会调 USART3_RxStart()，
+     其内部的 HAL_DMA_Abort 会把正在接收的预填充包冲掉。
+     120ms 足够它处理完并重新武装 RX，又不会让用户觉得卡。 */
+static const int     kPrefillDelayMs = 120;
+
 SerialIo::SerialIo(QObject *parent) :
     QObject(parent),
     m_port(new QSerialPort(this)),
@@ -138,6 +288,13 @@ SerialIo::SerialIo(QObject *parent) :
     m_reportCount(0),
     m_reportDropped(0),
     m_lastReportLogMs(0),
+    m_echoDriven(true),           /* 默认走新流控：固件只回显、不再发 55 44 AA */
+    m_echoPerPacket(64),          /* 兜底值：拿不到行信息时才用 */
+    m_prefillCount(2),            /* 1 包在雕 + 1 包备用 */
+    m_pumpedReports(0),
+    m_rowPixels(0),               /* beginImage() 里按实际图宽填 */
+    m_rowPackets(0),
+    m_echoAccum(0),
     m_cfgBaud(115200),
     m_cfgDataBits(8),
     m_cfgParity(ParityNone),     /* 无校验 8N1：与固件实测一致（原按需求配的奇校验是错的） */
@@ -738,7 +895,39 @@ bool SerialIo::sendStart()
 
     emitLog(QStringLiteral("已下发启动命令 55 66 AA —— 固件将开始取数据（队列 %1 包）")
             .arg(m_queue.size()));
+
+    /* ★ 回显驱动模式下必须主动预填充：
+         固件已经不再发 55 44 AA 了，它永远不会开口要第一包。
+         这里不喂，它一进主循环就只能拿 RX_data 里的陈旧数据去雕。
+
+       ★★ 为什么要延迟一拍（约 120ms）而不是立刻发：
+         固件在 waiting() 里收到 55 66 AA 之后会调 USART3_RxStart()，
+         而那个函数开头就是 HAL_DMA_Abort(&hdma_usart3_rx) ——
+         它会把**此刻正在接收的**预填充包直接冲掉。
+         （BT_Init() 里那 8 次循环更是每次都会 abort 一次。）
+         等固件把 55 66 AA 处理完、RX 重新武装好，再喂就稳了。 */
+    if (m_echoDriven)
+    {
+        emitLog(QStringLiteral("[>] 已下发启动命令，%1 ms 后预填充 %2 包"
+                               "（等固件处理完 55 66 AA 再喂，避免被其 RxStart 冲掉）")
+                .arg(kPrefillDelayMs).arg(m_prefillCount));
+        QTimer::singleShot(kPrefillDelayMs, this, SLOT(onPrefillTimeout()));
+    }
+
     return true;
+}
+
+void SerialIo::onPrefillTimeout()
+{
+    if (!m_echoDriven)
+        return;
+    if (m_queue.isEmpty())
+    {
+        emitLog(QStringLiteral("[!] 预填充时队列是空的，跳过"
+                               "（可能已中止，或还没点「发送整幅图」）"));
+        return;
+    }
+    prefillPackets();
 }
 
 void SerialIo::setHandshakeTimeout(int ms)
@@ -776,8 +965,42 @@ void SerialIo::onHandshakeTimeout()
         return;                       /* 发完了，不是超时 */
 
     const int left = m_queue.size();
-    emitLog(QStringLiteral("[!] 握手超时：%1 ms 没收到 0x55 0x44 0xAA（取数据），剩 %2 包未发")
-            .arg(m_hsTimeoutMs).arg(left));
+
+    /* ★ 两种流控方式，超时含义完全不同，提示必须分开：
+         回显驱动 → 等的是固件吐回显(33 gg EE)，说明它没在雕（卡死/限位/没启动）
+         请求驱动 → 等的是固件发 55 44 AA，说明它没开口要数据 */
+    if (m_echoDriven)
+    {
+        /* ★ 把"已收到几条回传帧"打出来 —— 这是最关键的判别信息：
+             累计 0 条   → 固件一条都没发出来，根本没在画点（卡在 BT_Init / 没进主循环 / TIM2 没跑）
+             0 < 累计 < 64 → 固件在画，但还没画够一包，只是慢，不是死
+             累计 ≥ 64  → 不该超时，属于误报 */
+        const int got = m_reportCount;
+        const int need = m_echoPerPacket;
+        const int inThisPkt = got - m_pumpedReports;
+
+        emitLog(QStringLiteral("[!] 回显超时：%1 ms 内没有补货动作，剩 %2 包未发\n"
+                               "    已收到回传帧：%3 条（本包内已收 %4 / %5）\n"
+                               "    %6")
+                .arg(m_hsTimeoutMs).arg(left)
+                .arg(got).arg(inThisPkt).arg(need)
+                .arg(got == 0
+                     ? QStringLiteral(
+                         "★ 累计 0 条 = 固件一条都没发出来，压根没在画点。\n"
+                         "      查：① 固件是否还在 BT_Init() 里等数据（Bluetooth.c 的 8 次 Send_Next 删了没）\n"
+                         "          ② 是否真的进了主循环 —— TIM2 是在 waiting() 之后才启动的\n"
+                         "          ③ TIM2 中断里 4 个限位开关任一有效会直接 return，步进全停\n"
+                         "          ④ 回传帧发送那几行（33 gg EE）是否真的开着")
+                     : (inThisPkt < need
+                        ? QStringLiteral("★ 固件在画，但本包还没满 —— 只是慢，不是死。可调大握手超时。")
+                        : QStringLiteral("★ 计数已够却没补货，属异常，检查队列是否为空。"))));
+    }
+    else
+    {
+        emitLog(QStringLiteral("[!] 握手超时：%1 ms 没收到 0x55 0x44 0xAA（取数据），剩 %2 包未发")
+                .arg(m_hsTimeoutMs).arg(left));
+    }
+
     m_timer->stop();
     emit handshakeTimedOut(m_hsTimeoutMs, left);
 }
@@ -905,6 +1128,13 @@ void SerialIo::onReadyRead()
         /* ---------- 其它字节：丢 1 字节 ---------- */
         m_rxBuf.remove(0, 1);
     }
+
+    /* ---- 2.5 回显驱动补货 ----
+       ★ 位置很关键：必须放在下面那句「全是回传帧就 return」之前。
+         新流控下固件不再发 55 44 AA，于是**绝大多数 onReadyRead 里 hit 都是 0**
+         （收到的全是 33 gg EE）。若把补货排在 return 之后，就永远轮不到补货，
+         链路会静悄悄饿死 —— 而且日志干干净净，极难排查。 */
+    maybePumpByEcho();
 
     const int hit = tokens.size();
 
@@ -1081,6 +1311,13 @@ void SerialIo::onReadyRead()
         ++m_reqCount;
         m_firstReqSeen = true;
 
+        /* ★★ 两条补货路径**并存**（不是互斥）—— 这是本方案的核心：
+             (a) 固件主动发 55 44 AA（Send_Next）→ 上位机回一包
+             (b) 固件每画满一包的点数（默认 64 条回传帧）→ 上位机自动补一包
+           启动/追赶阶段靠 (a) 快速把缓冲区填起来；
+           稳定雕刻阶段靠 (b) 按实际消耗速度背压补货。
+           两条路都通向同一个 pumpOne()，谁先到谁先发。 */
+
         if (m_queue.isEmpty())
         {
             /* 固件来要，但上位机手里没货。两种可能：
@@ -1099,9 +1336,16 @@ void SerialIo::onReadyRead()
             continue;
         }
 
-        /* 真正写一包。这就是"收到一个才发一个"的落点。 */
+        /* 真正写一包 —— 补货路径 (a)：固件发 55 44 AA 要，就给一个。 */
         pumpOne();
         ++m_hsSent;
+        if (mayLog)
+        {
+            m_lastRxLogMs = now;
+            emitLog(QStringLiteral("[>] 收到 0x55 0x44 0xAA #%1 → 补 1 包"
+                                   "（路径 a：Next 请求；已收回传帧 %2 条）")
+                    .arg(m_reqCount).arg(m_reportCount));
+        }
         emit requestReceived(m_reqCount, m_queue.size());
     }
 
@@ -1308,6 +1552,12 @@ void SerialIo::beginImage(int width, int height, bool bidi)
     const int pktsPerRow = (width + kPixPerPkt - 1) / kPixPerPkt;
     m_totalPkts = pktsPerRow * height;
 
+    /* ★ 记下"一行有多少像素 / 占几包"，回显补货要按这个精确换算。
+       固件画完一行 == 发 width 条回传帧 == 消耗 pktsPerRow 包。 */
+    m_rowPixels  = width;
+    m_rowPackets = pktsPerRow;
+    m_echoAccum  = 0;
+
     /* 注意：m_cfgReqCount 不在这里重置 —— 配置交换是按"会话"计的，
        不属于某一幅图，重置了反而看不出"这台设备一共要过几次配置"。 */
     m_reqCount = 0;
@@ -1317,10 +1567,30 @@ void SerialIo::beginImage(int width, int height, bool bidi)
     m_rxBuf.clear();
     m_hsTimer->stop();
 
+    /* 换一幅图就把回传/补货基准一起归零：
+       回传计数是按"第几个到达的点"累加的，跨图不清会让新图的补货错位。 */
+    resetReportStats();
+
     emitLog(QStringLiteral("[>] 开始下发 %1 x %2，共 %3 行 / %4 包，模式=%5")
             .arg(width).arg(height).arg(height).arg(m_totalPkts)
-            .arg(isHandshake() ? QStringLiteral("握手(等 0x55 0x44 0xAA)")
-                               : QStringLiteral("自由(包间隔 %1ms)").arg(m_intervalMs)));
+            .arg(m_echoDriven
+                 ? QStringLiteral("回显驱动(每行 %1 条回显 → 补 %2 包)")
+                       .arg(m_rowPixels).arg(m_rowPackets)
+                 : QStringLiteral("握手(等 0x55 0x44 0xAA)")));
+
+    /* ★ 把换算比讲清楚 —— 这是判断"为什么图窄了会全白"的关键数字 */
+    if (m_echoDriven && (m_rowPixels > 0))
+    {
+        const double naive = (double)m_rowPixels / (double)m_echoPerPacket;   /* 旧算法每行补多少 */
+        const double lack  = (double)m_rowPackets - naive;                    /* 每行亏几包 */
+        emitLog(QStringLiteral("[>] 补货换算：固件每行发 %1 条回传帧、消耗 %2 包"
+                               "（若按固定 %3 条补 1 包，每行只能补 %4 包，"
+                               "每行亏 %5 包 → 亏空 %6%）")
+                .arg(m_rowPixels).arg(m_rowPackets).arg(m_echoPerPacket)
+                .arg(naive, 0, 'f', 2)
+                .arg(lack, 0, 'f', 2)
+                .arg((lack / (double)m_rowPackets) * 100.0, 0, 'f', 1));
+    }
 }
 
 /**

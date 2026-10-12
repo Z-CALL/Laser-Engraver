@@ -115,8 +115,9 @@ private:
     QSpinBox  *m_heightSpin;
 
     QCheckBox *m_bidiBox;     /* 弓字形：奇数行倒序 */
-    QSpinBox  *m_grayLoSpin;  /* 灰度映射下限 */
-    QSpinBox  *m_grayHiSpin;  /* 灰度映射上限 */
+    QSpinBox  *m_grayLoSpin;  /* 灰度映射下限（导出 C 数组时用） */
+    QSpinBox  *m_grayHiSpin;  /* 灰度映射上限（导出 C 数组时用） */
+    QSpinBox  *m_grayCutSpin; /* ★ 背景截断阈值（雕刻用）：出光强度低于它的点归零 */
 
     QPushButton    *m_openBtn;
     QPushButton    *m_grayBtn;
