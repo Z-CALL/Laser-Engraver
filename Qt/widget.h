@@ -94,7 +94,7 @@ private:
        固件每画完一个像素回传一条（0x33 灰度 0xEE），这里把点依次打到画布上。
        ★ 按"第几个到达"落点：固件不报坐标，而按到达顺序画出来的正是
          **固件实际的输出顺序** —— 重复 / 跳行 / 错位会直接在画面上显形。 */
-    void monitorBegin(int w, int h);   /* 开工：清空画布、切到监看页 */
+    void monitorBegin(int w, int h, bool bidi);   /* 开工：清空画布、切到监看页 */
     void monitorFeed(int gray);
     void monitorEnd(bool aborted);
     void monitorRepaint();
@@ -162,6 +162,10 @@ private:
     bool          m_monitorActive;     /* 是否正在监看 */
     int           m_monitorW;
     int           m_monitorH;
+    /* ★ 开工那一刻锁存的"是否弓字形" —— 不能实时读复选框：
+       数据的方向是 sendImage 里 beginImage() 定的，
+       若中途改了勾选，监看落点就和实际数据方向对不上，会画出"隔行镜像"的假故障。 */
+    bool          m_monitorBidi;
     int           m_monitorGot;        /* 已收到的点数 */
     qint64        m_monitorLastPaintMs;/* 重绘节流 */
 

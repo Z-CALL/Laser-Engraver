@@ -30,6 +30,11 @@
    见 buildUi() 里 m_grayCutSpin 的注释：小尺寸图建议调小甚至调 0。 */
 static const int kGrayCutoffDefault = 20;
 
+/* ★ 构建标记：显示在标题栏 + 启动日志。
+   目的：一眼确认"现在跑的到底是哪一版 exe"。
+   踩过的坑：跑了旧包，把已经修好的问题当成没修好，白排查一整轮。 */
+static const char *kBuildTag = "B20261013-2020";
+
 /* SerialIo 的日志回调 -> 回到 Widget::logMsg（回调在 GUI 线程内被调用，直接操作控件是安全的） */
 static void serialLogTrampoline(void *ctx, const QString &line)
 {
@@ -67,6 +72,7 @@ Widget::Widget(QWidget *parent) :
     m_monitorActive      = false;
     m_monitorW           = 0;
     m_monitorH           = 0;
+    m_monitorBidi        = true;
     m_monitorGot         = 0;
     m_monitorLastPaintMs = 0;
 
@@ -96,7 +102,13 @@ Widget::Widget(QWidget *parent) :
 
     onSerialRefresh();
 
-    setWindowTitle(QStringLiteral("激光雕刻上位机 - 图片转灰度数组"));
+    setWindowTitle(QStringLiteral("激光雕刻上位机 - 图片转灰度数组  [%1]")
+                   .arg(QString::fromLatin1(kBuildTag)));
+
+    /* ★ 启动就把构建号写进日志：标题栏 + 日志双保险，
+       以后一眼就能确认"现在跑的到底是哪一版"。 */
+    logMsg(QStringLiteral("构建版本 %1（监看已含弓字形奇数行校正）")
+           .arg(QString::fromLatin1(kBuildTag)), true);
 
     int w = 600;
     int h = 1024;
@@ -566,13 +578,16 @@ void Widget::onViewSwap()
  * 开工：**清空画布**并立刻切到监看页（灰度预览让位）。
  * 清空后画布是全黑的，固件回传的点会一个个点亮上去。
  */
-void Widget::monitorBegin(int w, int h)
+void Widget::monitorBegin(int w, int h, bool bidi)
 {
     if ((w <= 0) || (h <= 0))
         return;
 
     m_monitorW = w;
     m_monitorH = h;
+    /* ★ 锁存本次下发的行方向：整幅雕刻期间不变，
+       免得中途改勾选导致监看落点和数据方向对不上。 */
+    m_monitorBidi = bidi;
     m_monitorGot = 0;
     m_monitorActive = true;
     m_monitorLastPaintMs = 0;
@@ -623,8 +638,11 @@ void Widget::monitorFeed(int gray)
     /* ★ 弓字形校正：奇数行固件是反向走的（右→左），回传顺序也是反的。
        若按到达顺序直接从左往右画，奇数行会整体左右镜像 ——
        对有朝向细节的图案（龙爪、龙须、文字）会产生"编织/拉花"般的碎条纹，
-       这就是监看画面看起来被剪碎的原因。这里把奇数行画回图纸方向。 */
-    if (m_bidiBox->isChecked() && ((y & 1) != 0))
+       这就是监看画面看起来被剪碎的原因。这里把奇数行画回图纸方向。
+
+       ★★ 用 m_monitorBidi（开工时锁存），不用 m_bidiBox->isChecked()：
+       数据方向是 beginImage() 定下的，中途改勾选会让两者不一致。 */
+    if (m_monitorBidi && ((y & 1) != 0))
         x = m_monitorW - 1 - x;
 
     /* ★ 极性：固件回传的 gray 是"出光强度"（0=不出光=白纸，255=满功率=烧黑）。
@@ -1136,8 +1154,9 @@ void Widget::onSerialSend()
     m_serOpenBtn->setEnabled(false);
     m_serClock.start();
 
-    /* ★ 进入雕刻：清空监看画布并切到监看页，开始接收固件回传的每一个像素 */
-    monitorBegin(w, h);
+    /* ★ 进入雕刻：清空监看画布并切到监看页，开始接收固件回传的每一个像素。
+       行方向在这里一并锁存（与下面 beginImage 用的是同一个值）。 */
+    monitorBegin(w, h, m_bidiBox->isChecked());
 
     /* 用 beginImage + 逐行 feedRow：每行之间回一次事件循环，进度条才动得起来。
        倒序（弓字形）在 SerialIo 内部按行号判定，这里只负责给原始行。 */
