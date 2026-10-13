@@ -181,7 +181,7 @@ int main(void)
 	sys_state = working;
 	
 	RX_write_cusor = 0;
-	
+    HAL_GPIO_TogglePin(x_dir_grop, x_dir_pin);
 	
   /* USER CODE END 2 */
 

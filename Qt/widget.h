@@ -44,6 +44,12 @@ private slots:
     void refreshGray();       /* 按当前参数重算灰度与预览 */
     void onSaveGrayArray();   /* 导出灰度 C 二维数组 */
 
+    /* ★ 尺寸联动：勾了"锁定宽高比"时，改一边，另一边按**原图比例**自动跟上，
+       保证图形不被拉伸。两个槽互为对称，靠 m_sizeSyncing 防递归。 */
+    void onSizeWidthChanged(int w);
+    void onSizeHeightChanged(int h);
+    void onLockRatioToggled();  /* 刚勾上时立刻按当前宽度把高度对齐一次 */
+
     /* 串口面板 */
     void onSerialRefresh();   /* 重新枚举端口 */
     void onSerialOpenClose(); /* 打开/关闭串口 */
@@ -113,6 +119,8 @@ private:
     QLabel    *m_status;
     QSpinBox  *m_widthSpin;
     QSpinBox  *m_heightSpin;
+    QCheckBox *m_lockRatioBox;/* ★ 锁定宽高比：改一边，另一边按原图比例跟着变 */
+    bool       m_sizeSyncing; /* 联动中标志：防止宽/高互相触发来回改 */
 
     QCheckBox *m_bidiBox;     /* 弓字形：奇数行倒序 */
     QSpinBox  *m_grayLoSpin;  /* 灰度映射下限（导出 C 数组时用） */

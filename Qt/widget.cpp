@@ -33,7 +33,7 @@ static const int kGrayCutoffDefault = 20;
 /* ★ 构建标记：显示在标题栏 + 启动日志。
    目的：一眼确认"现在跑的到底是哪一版 exe"。
    踩过的坑：跑了旧包，把已经修好的问题当成没修好，白排查一整轮。 */
-static const char *kBuildTag = "B20261013-2020";
+static const char *kBuildTag = "B20261013-2050";
 
 /* SerialIo 的日志回调 -> 回到 Widget::logMsg（回调在 GUI 线程内被调用，直接操作控件是安全的） */
 static void serialLogTrampoline(void *ctx, const QString &line)
@@ -75,6 +75,7 @@ Widget::Widget(QWidget *parent) :
     m_monitorBidi        = true;
     m_monitorGot         = 0;
     m_monitorLastPaintMs = 0;
+    m_sizeSyncing        = false;
 
     connect(m_ser, SIGNAL(packetSent(int,int,quint16,int)),
             this, SLOT(onSerialPacketSent(int,int,quint16,int)));
@@ -207,12 +208,26 @@ void Widget::buildUi()
     m_heightSpin->setValue(64);
     grid->addWidget(m_heightSpin, 0, 3);
 
+    /* ★ 锁定宽高比：勾上之后改宽度 → 高度按**原图的宽高比**自动算出来（反之亦然）。
+       基准取原图而不是"当前的宽:高"，所以中途手调过尺寸也不会把比例带歪，
+       换一张图之后比例自动跟着新图走。
+       默认不勾：想刻正方形之类的非原图比例时不受干扰。 */
+    m_lockRatioBox = new QCheckBox(
+        QStringLiteral("锁定宽高比（改一边，另一边按原图比例自动跟）"), m_mainPage);
+    m_lockRatioBox->setChecked(false);
+    m_lockRatioBox->setToolTip(QStringLiteral(
+        "勾选后：改「目标宽」按原图比例自动算「目标高」，改高同理。\n"
+        "基准是**原图**的宽高比，不是当前输入框里的比值 ——\n"
+        "这样中途手调过尺寸也不会把比例带歪，换图后比例自动跟着新图走。\n"
+        "想刻正方形等非原图比例时把它取消勾选即可。"));
+    grid->addWidget(m_lockRatioBox, 1, 0, 1, 4);
+
     /* 极性固定为黑=255：图像灰度按通用定义是 0=黑/255=白（它表示**亮度**），
        而雕刻要的是**出光强度**且"越黑越烧" —— 两者方向相反，代码里固定做 255-v。
        预览已翻回来显示，所以预览里深色的地方才是会烧的地方。 */
     QLabel *polLabel = new QLabel(QStringLiteral("灰度极性：黑=255(越黑越出光)"), m_mainPage);
     polLabel->setStyleSheet("color: gray;");
-    grid->addWidget(polLabel, 1, 0, 1, 4);
+    grid->addWidget(polLabel, 2, 0, 1, 4);
     main->addLayout(grid);
 
     /* ---- 导出参数 ---- */
@@ -500,8 +515,12 @@ void Widget::buildUi()
 
     /* ---- 信号 ---- */
     connect(m_openBtn,    SIGNAL(clicked()), this, SLOT(onOpenImage()));
-    connect(m_widthSpin,  SIGNAL(valueChanged(int)), this, SLOT(refreshGray()));
-    connect(m_heightSpin, SIGNAL(valueChanged(int)), this, SLOT(refreshGray()));
+    /* ★ 宽高改成走联动槽（槽内部最后统一调一次 refreshGray）：
+       一次改动只需要重算一遍灰度 —— 4096x4096 那种大图算两遍会很卡。
+       注意顺序：必须先接联动槽；直接接 refreshGray 会导致算两遍。 */
+    connect(m_widthSpin,  SIGNAL(valueChanged(int)), this, SLOT(onSizeWidthChanged(int)));
+    connect(m_heightSpin, SIGNAL(valueChanged(int)), this, SLOT(onSizeHeightChanged(int)));
+    connect(m_lockRatioBox, SIGNAL(toggled(bool)),   this, SLOT(onLockRatioToggled()));
     connect(m_grayBtn,    SIGNAL(clicked()), this, SLOT(onSaveGrayArray()));
 
     connect(m_serRefreshBtn,    SIGNAL(clicked()), this, SLOT(onSerialRefresh()));
@@ -1308,10 +1327,110 @@ void Widget::loadImage(const QString &path)
         w = qRound(w * s);
         h = qRound(h * s);
     }
+    /* ★ 载图时 w/h 是一起算好的，先把联动关掉再写：
+       否则写宽度会触发"按比例算高度"，把这里刚算好的 h 覆盖掉
+       （同一张图算出来基本一致，但四舍五入可能差 1 点，而且白算一遍灰度）。 */
+    m_sizeSyncing = true;
     m_widthSpin->setValue(w);
     m_heightSpin->setValue(h);
+    m_sizeSyncing = false;
 
     refreshGray();
+}
+
+/* ================= 目标尺寸联动（锁定宽高比） ================= */
+
+/**
+ * 按**原图**宽高比算另一边的点数。
+ *
+ * ★ 基准取原图，不取两个输入框当前的比值：
+ *   输入框可能已经被手调成非原图比例（比如想刻正方形），
+ *   拿它当基准会把比例一路带偏；用原图则永远对齐真实形状，
+ *   换一张图之后也会自动跟着新图的比例走。
+ * ★ 没载图时返回 0 = "无从换算"，调用方跳过联动。
+ */
+static int ratioCounterpart(const QImage &src, int known, bool knownIsWidth)
+{
+    if (src.isNull() || src.width() <= 0 || src.height() <= 0)
+        return 0;
+
+    const double v = knownIsWidth
+                     ? (double)known * src.height() / src.width()
+                     : (double)known * src.width()  / src.height();
+    return qRound(v);
+}
+
+/**
+ * 改「目标宽」→ 勾了锁定就按原图比例把「目标高」改掉。
+ *
+ * ★ 联动用 setValue 回写对边，那会再次触发对边的槽；
+ *   靠 m_sizeSyncing 让对边那个槽**直接返回**，
+ *   这样一次改动只走一条路径、只算一遍灰度（大图算两遍很卡）。
+ */
+void Widget::onSizeWidthChanged(int w)
+{
+    if (m_sizeSyncing)
+        return;
+
+    if (m_lockRatioBox && m_lockRatioBox->isChecked())
+    {
+        const int h = ratioCounterpart(m_srcImage, w, true);
+        if (h > 0)
+        {
+            const int hv = qBound(1, h, m_heightSpin->maximum());
+            if (hv != m_heightSpin->value())
+            {
+                m_sizeSyncing = true;
+                m_heightSpin->setValue(hv);
+                m_sizeSyncing = false;
+            }
+            /* 只有极端长宽比（原图比例 > 4096:1）才会被上限截断。
+               这里用日志而不是状态栏 —— 状态栏马上会被 refreshGray 覆盖掉。 */
+            if (hv != h)
+                logMsg(QStringLiteral("[!] 高度按比例应为 %1 点，超出上限已截为 %2 点，比例已变形")
+                       .arg(h).arg(hv), false);
+        }
+    }
+
+    refreshGray();
+}
+
+/** 改「目标高」→ 对称处理（见 onSizeWidthChanged 的说明） */
+void Widget::onSizeHeightChanged(int h)
+{
+    if (m_sizeSyncing)
+        return;
+
+    if (m_lockRatioBox && m_lockRatioBox->isChecked())
+    {
+        const int w = ratioCounterpart(m_srcImage, h, false);
+        if (w > 0)
+        {
+            const int wv = qBound(1, w, m_widthSpin->maximum());
+            if (wv != m_widthSpin->value())
+            {
+                m_sizeSyncing = true;
+                m_widthSpin->setValue(wv);
+                m_sizeSyncing = false;
+            }
+            if (wv != w)
+                logMsg(QStringLiteral("[!] 宽度按比例应为 %1 点，超出上限已截为 %2 点，比例已变形")
+                       .arg(w).arg(wv), false);
+        }
+    }
+
+    refreshGray();
+}
+
+/**
+ * 刚把「锁定宽高比」勾上时，立刻按当前宽度对齐一次高度。
+ * 否则用户要再拨一下宽度才看得到效果，会以为没生效。
+ * 取消勾选不做任何事 —— 保持当前尺寸，接下来手调即可。
+ */
+void Widget::onLockRatioToggled()
+{
+    if (m_lockRatioBox && m_lockRatioBox->isChecked())
+        onSizeWidthChanged(m_widthSpin->value());
 }
 
 void Widget::refreshGray()
