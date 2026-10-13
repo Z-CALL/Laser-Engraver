@@ -33,7 +33,7 @@ static const int kGrayCutoffDefault = 20;
 /* ★ 构建标记：显示在标题栏 + 启动日志。
    目的：一眼确认"现在跑的到底是哪一版 exe"。
    踩过的坑：跑了旧包，把已经修好的问题当成没修好，白排查一整轮。 */
-static const char *kBuildTag = "B20261013-2050";
+static const char *kBuildTag = "B20261013-2110";
 
 /* SerialIo 的日志回调 -> 回到 Widget::logMsg（回调在 GUI 线程内被调用，直接操作控件是安全的） */
 static void serialLogTrampoline(void *ctx, const QString &line)
@@ -452,6 +452,30 @@ void Widget::buildUi()
     cfgRow->addWidget(m_serConfigBtn);
     main->addLayout(cfgRow);
 
+    /* ★ 加工前先走一个图宽 —— 把「原点X」自动设成图像宽度。
+       需求来源：图纸的原点是**左上角**，而加工起始点落在图像右上角，
+       所以要先把 X 走一个图宽，第 0 行再走回来，图像左上角才和机器原点对上。
+
+       ★ 这条链路本来就通，**不需要改固件、不用重烧**：
+           界面「原点X」→ 配置包字节 11/12（标签 0x77）
+           → 固件 Bluetooth.c:58  x_work_orgin
+           → 固件 main.c:169      goto_point(x_work_orgin, y_work_orgin) 开工前先走过去
+       所以这里只做"把原点X 自动填成图宽"这一件事。
+
+       ⚠ 改完必须重新「下发配置」（或复位板子让固件重新来要配置）才生效 ——
+         原点是在配置包里下发的，不重发固件还用旧的。 */
+    m_orgByWidthBox = new QCheckBox(
+        QStringLiteral("加工前先走一个图宽（原点X 自动 = 图像宽度）"), m_mainPage);
+    m_orgByWidthBox->setChecked(false);
+    m_orgByWidthBox->setToolTip(QStringLiteral(
+        "勾选后，「原点X」自动等于当前图像的宽度（点数）。\n\n"
+        "固件开工前会先 goto_point(原点X, 原点Y) 走过去，\n"
+        "于是机头先走一个图宽，第 0 行再走回来 ——\n"
+        "图像左上角正好落在机器原点上。\n\n"
+        "⚠ 改完记得重新「下发配置」（或复位板子让固件重新来要），\n"
+        "   否则固件还在用上一次的旧原点。"));
+    main->addWidget(m_orgByWidthBox);
+
     m_serBar = new QProgressBar(m_mainPage);
     m_serBar->setRange(0, 100);
     m_serBar->setValue(0);
@@ -521,6 +545,7 @@ void Widget::buildUi()
     connect(m_widthSpin,  SIGNAL(valueChanged(int)), this, SLOT(onSizeWidthChanged(int)));
     connect(m_heightSpin, SIGNAL(valueChanged(int)), this, SLOT(onSizeHeightChanged(int)));
     connect(m_lockRatioBox, SIGNAL(toggled(bool)),   this, SLOT(onLockRatioToggled()));
+    connect(m_orgByWidthBox, SIGNAL(toggled(bool)),  this, SLOT(onOrgByWidthToggled()));
     connect(m_grayBtn,    SIGNAL(clicked()), this, SLOT(onSaveGrayArray()));
 
     connect(m_serRefreshBtn,    SIGNAL(clicked()), this, SLOT(onSerialRefresh()));
@@ -1163,6 +1188,18 @@ void Widget::onSerialSend()
                .arg(m_serIntervalSpin->value())
                .arg(seconds, 0, 'f', 1), true);
 
+    /* ★ 每次开工都把当前生效的作业原点报一遍 ——
+       原点是在**配置包**里下发的，勾了「先走一个图宽」却忘了重发配置，
+       固件就还在用旧原点；而症状只是"整体偏移一个图宽"，
+       图本身完全正常，肉眼很容易漏过去。 */
+    logMsg(QStringLiteral("作业原点: X=%1  Y=%2%3")
+           .arg(m_cfgXOrgSpin->value())
+           .arg(m_cfgYOrgSpin->value())
+           .arg((m_orgByWidthBox && m_orgByWidthBox->isChecked())
+                ? QStringLiteral("   ← 已开「先走一个图宽」；刚改过的话必须重新下发配置才生效")
+                : QString()),
+           true);
+
     m_serSentPkts  = 0;
     m_serTotalPkts = (int)qMin<qint64>(totalPkts, 2000000000LL);
     m_serBar->setRange(0, m_serTotalPkts);
@@ -1433,6 +1470,40 @@ void Widget::onLockRatioToggled()
         onSizeWidthChanged(m_widthSpin->value());
 }
 
+/**
+ * 「加工前先走一个图宽」的勾选处理。
+ *
+ * 勾上 → 立刻把「原点X」设成当前图像宽度，并且**锁住输入框**：
+ *   托管期间它的值必须恒等于图宽，手改一下就会和图像对不上，
+ *   而且这种错很难看出来（只是整体偏移一个图宽，图本身还是好的）。
+ * 取消 → 立刻解锁，值保留（用户想调成别的偏移随时改）。
+ */
+void Widget::onOrgByWidthToggled()
+{
+    if (!m_orgByWidthBox || !m_cfgXOrgSpin)
+        return;
+
+    const bool on = m_orgByWidthBox->isChecked();
+
+    m_cfgXOrgSpin->setReadOnly(on);
+    /* 托管时给个底色提示，不然用户会以为输入框坏了 */
+    m_cfgXOrgSpin->setStyleSheet(on ? "background:#eef; color:#036;" : QString());
+
+    if (on)
+    {
+        const int w = m_widthSpin->value();
+        m_cfgXOrgSpin->setValue(w);
+        logMsg(QStringLiteral("已开启「加工前先走一个图宽」：原点X 托管为图像宽度 %1 点。"
+                              "⚠ 记得重新「下发配置」或复位板子，否则固件还用旧原点。")
+               .arg(w), true);
+    }
+    else
+    {
+        logMsg(QStringLiteral("已取消「加工前先走一个图宽」：原点X 交回手动输入（当前 %1 点）。")
+               .arg(m_cfgXOrgSpin->value()), true);
+    }
+}
+
 void Widget::refreshGray()
 {
     if (m_srcImage.isNull())
@@ -1480,6 +1551,13 @@ void Widget::refreshGray()
        载入新图后自动同步一次，省得用户手动填、填错导致固件按错的尺寸摆点。 */
     m_cfgXSpin->setValue(w);
     m_cfgYSpin->setValue(h);
+
+    /* ★ 勾了「加工前先走一个图宽」→ 原点X 跟着图像宽度走。
+       放这里而不是放 onSizeWidthChanged()：载图、改尺寸、改比例锁定，
+       任何一条会让 w 变化的路径最后都会走到 refreshGray()，
+       只在这里同步一次就不会漏。 */
+    if (m_orgByWidthBox && m_orgByWidthBox->isChecked())
+        m_cfgXOrgSpin->setValue(w);
 
     /* ★ 换了新图纸就切回预览页：否则看到的还是上一幅的监看画面，
        会误以为"新图已经画上去了"或"图纸没换"。 */

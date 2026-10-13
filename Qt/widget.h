@@ -49,6 +49,7 @@ private slots:
     void onSizeWidthChanged(int w);
     void onSizeHeightChanged(int h);
     void onLockRatioToggled();  /* 刚勾上时立刻按当前宽度把高度对齐一次 */
+    void onOrgByWidthToggled(); /* 勾上/取消"加工前先走一个图宽"时同步原点X */
 
     /* 串口面板 */
     void onSerialRefresh();   /* 重新枚举端口 */
@@ -151,6 +152,9 @@ private:
     QSpinBox     *m_cfgSpeedSpin;
     QSpinBox     *m_cfgXOrgSpin;       /* X 轴作业原点（像素） */
     QSpinBox     *m_cfgYOrgSpin;       /* Y 轴作业原点（像素） */
+    /* ★ 加工前先走一个图宽：勾上后「原点X」由图像宽度托管（输入框禁用），
+       等价于让固件先 goto_point(图宽, ...) 再开工 —— 把图像左上角对到机器原点。 */
+    QCheckBox    *m_orgByWidthBox;
     QPushButton  *m_serConfigBtn;
     QProgressBar *m_serBar;
     QLabel       *m_serInfo;
