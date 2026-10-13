@@ -387,6 +387,12 @@ bool SerialIo::open(const QString &portName)
 {
     close();
 
+    /* ★ 就绪计数按"本次会话"计：重新打开端口就归零。
+       界面靠它判断"固件到底有没有进过 waiting()" ——
+       见 Widget::onSerialSend() 里那个开工前体检。
+       不归零的话，上一次会话收到的就绪帧会让本次误判成"已就绪"。 */
+    m_readyCount = 0;
+
     if (portName.isEmpty())
     {
         m_state = QStringLiteral("端口名为空");
@@ -943,6 +949,11 @@ int SerialIo::handshakeTimeout() const
 int SerialIo::requestCount() const
 {
     return m_reqCount;
+}
+
+int SerialIo::readyCount() const
+{
+    return m_readyCount;
 }
 
 int SerialIo::handshakeSentCount() const

@@ -33,7 +33,7 @@ static const int kGrayCutoffDefault = 20;
 /* ★ 构建标记：显示在标题栏 + 启动日志。
    目的：一眼确认"现在跑的到底是哪一版 exe"。
    踩过的坑：跑了旧包，把已经修好的问题当成没修好，白排查一整轮。 */
-static const char *kBuildTag = "B20261013-2110";
+static const char *kBuildTag = "B20261013-2115";
 
 /* SerialIo 的日志回调 -> 回到 Widget::logMsg（回调在 GUI 线程内被调用，直接操作控件是安全的） */
 static void serialLogTrampoline(void *ctx, const QString &line)
@@ -1166,6 +1166,42 @@ void Widget::onSerialSend()
                 QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
             return;
         m_ser->abortStream();
+    }
+
+    /* ★★ 开工前体检：固件到底在不在待命点？ ★★
+       这是本项目最贵的一次踩坑，必须拦住：
+
+       固件只在 waiting() 里认 55 66 AA。它要是不在 waiting()
+       （刚刻完停在 while(1)、或还在跑上一幅被中止的像素数），
+       我们的启动命令就只是串口上一串没人理的字节 ——
+       它继续按自己的 y.all_point 空跑，读的是全零的 RX_data：
+         · 机器一直在动            （步进照走）
+         · 但不雕刻                （set_delay_time(0) → 不出光）
+         · 回显全是白色            （回传的灰度就是 0）
+       而且要把 图宽×图高 个像素跑完才停 —— 474x476 约 15 分钟，
+       全程看起来"在工作"，实际上什么都没刻。
+
+       判据只有一个：waiting() 里的固件会主动发就绪帧 55 77 AA。
+       只要本次会话收到过 ≥1 条，就说明它进过 waiting()。 */
+    if (m_ser->isHandshake() && m_ser->readyCount() == 0)
+    {
+        logMsg(QStringLiteral("[!] 开工体检未通过：本次会话没收到过固件就绪帧（55 77 AA）"), false);
+        if (QMessageBox::question(this, QStringLiteral("固件可能不在待命状态"),
+                QStringLiteral(
+                    "从打开串口到现在，**没有收到固件的就绪帧（55 77 AA）**。\n\n"
+                    "这说明板子很可能没停在 waiting()，现在发会有两种结果：\n\n"
+                    "  · 板子刚上电/刚复位过 → 正常，继续发即可\n"
+                    "  · 板子还在跑上一幅、或停在 while(1)\n"
+                    "    → 现象是「机器一直在动、但不雕刻、回显全白」，\n"
+                    "      而且要空跑完 图宽×图高 个像素才停（474×476 约 15 分钟）\n\n"
+                    "建议：先按一下板子的复位键，等日志出现「固件就绪」再发。\n\n"
+                    "确定要硬发吗？"),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+        {
+            setStatus(QStringLiteral("已取消下发 —— 请先复位板子，等日志出现「固件就绪（55 77 AA）」"), false);
+            return;
+        }
+        logMsg(QStringLiteral("[!] 用户选择硬发 —— 若机器一直在动却不雕刻，就是固件不在待命点"), false);
     }
 
     const int w = m_gray.width();
