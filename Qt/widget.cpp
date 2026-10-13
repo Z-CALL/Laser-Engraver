@@ -33,7 +33,7 @@ static const int kGrayCutoffDefault = 20;
 /* ★ 构建标记：显示在标题栏 + 启动日志。
    目的：一眼确认"现在跑的到底是哪一版 exe"。
    踩过的坑：跑了旧包，把已经修好的问题当成没修好，白排查一整轮。 */
-static const char *kBuildTag = "B20261013-2020";
+static const char *kBuildTag = "B20261013-2205";
 
 /* SerialIo 的日志回调 -> 回到 Widget::logMsg（回调在 GUI 线程内被调用，直接操作控件是安全的） */
 static void serialLogTrampoline(void *ctx, const QString &line)
@@ -74,6 +74,7 @@ Widget::Widget(QWidget *parent) :
     m_monitorH           = 0;
     m_monitorBidi        = true;
     m_monitorGot         = 0;
+    m_firstPktAllZero    = true;
     m_monitorLastPaintMs = 0;
 
     connect(m_ser, SIGNAL(packetSent(int,int,quint16,int)),
@@ -589,6 +590,7 @@ void Widget::monitorBegin(int w, int h, bool bidi)
        免得中途改勾选导致监看落点和数据方向对不上。 */
     m_monitorBidi = bidi;
     m_monitorGot = 0;
+    m_monitorFirstHex.clear();       /* ★ 自诊断计数跟着新一幅图归零 */
     m_monitorActive = true;
     m_monitorLastPaintMs = 0;
 
@@ -652,6 +654,41 @@ void Widget::monitorFeed(int gray)
        这样监看画面和实物观感一致：烧过的地方是黑的。 */
     uchar *row = m_monitorImg.scanLine(y);
     row[x] = (uchar)(255 - qBound(0, gray, 255));
+
+    /* ★★ 自诊断：把固件回传的**前 16 个灰度原样**打出来，并直接下结论。
+       这是判断"固件到底吃到了什么"最直接的证据 ——
+       比看画布白不白可靠得多（画布本来就是白底，白 = 没画到 或 画了但灰度 0）。 */
+    if (m_monitorGot <= 16)
+    {
+        m_monitorFirstHex += QStringLiteral("%1 ").arg(gray, 2, 16, QChar('0')).toUpper();
+        if (m_monitorGot == 16)
+        {
+            logMsg(QStringLiteral("[诊断] 固件回传的前 16 个灰度: %1")
+                   .arg(m_monitorFirstHex.trimmed()), true);
+
+            const QStringList parts = m_monitorFirstHex.trimmed().split(QChar(' '));
+            bool echoAllZero = !parts.isEmpty();
+            for (const QString &t : parts)
+                if (t != QStringLiteral("00")) { echoAllZero = false; break; }
+
+            if (echoAllZero && !m_firstPktAllZero)
+                logMsg(QStringLiteral(
+                    "★ 结论：上位机发出去的是**真实数据**，但固件回传全是 0 —— "
+                    "固件没吃到我发的包（链路/时序问题），不是数据问题。\n"
+                    "     查：① goto_point 阻塞期间预填充被冲掉/错位（原点非 0 时会阻塞）\n"
+                    "         ② 固件 USART3_RxStart() 只在 if(RX_number==69) 里调用，"
+                    "半帧一次就永久不重装 DMA\n"
+                    "         ③ 帧边界错位后不会自纠（69 对 69）"), false);
+            else if (echoAllZero && m_firstPktAllZero)
+                logMsg(QStringLiteral(
+                    "★ 结论：**发出去的数据本身就是 0** —— 不是链路问题。"
+                    "看状态栏「不出光的点占 X%」，把「背景截断阈值」调小（可试 0）后重新载图。"), false);
+            else
+                logMsg(QStringLiteral(
+                    "★ 数据链路是通的：固件回传了非 0 灰度。"
+                    "若实物仍不刻，问题在激光/功率/对焦，不在数据。"), true);
+        }
+    }
 
     /* 重绘节流：每 40ms 刷一次。
        ★ 必须节流：固件一个点约 3ms，不节流会每秒重绘 300 次，界面卡死。 */
@@ -1143,6 +1180,27 @@ void Widget::onSerialSend()
                .arg(m_bidiBox->isChecked() ? QStringLiteral("是") : QStringLiteral("否"))
                .arg(m_serIntervalSpin->value())
                .arg(seconds, 0, 'f', 1), true);
+
+    /* ★★ 自诊断（发侧）：把"即将发出去的首包前 16 个字节"原样打出来。
+       和固件回传的灰度对照就能立刻分开两种故障：
+         发出去非 0 + 回传全 0 → 固件没收到（链路/时序）
+         发出去本来就是 0      → 数据被灰度阈值砍光了（改阈值即可） */
+    {
+        const uchar *p0 = m_gray.constScanLine(0);
+        const int n = qMin(16, w);
+        QString s;
+        int nz = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            s += QStringLiteral("%1 ").arg(p0[i], 2, 16, QChar('0')).toUpper();
+            if (p0[i] != 0) ++nz;
+        }
+        m_firstPktAllZero = (nz == 0);
+        logMsg(QStringLiteral("[诊断] 待发首包前 %1 字节: %2").arg(n).arg(s.trimmed()), true);
+        if (m_firstPktAllZero)
+            logMsg(QStringLiteral("[诊断] ⚠ 这 %1 字节全是 0 —— 数据本身就没内容，"
+                                  "先把「背景截断阈值」调小（可试 0）再发").arg(n), false);
+    }
 
     m_serSentPkts  = 0;
     m_serTotalPkts = (int)qMin<qint64>(totalPkts, 2000000000LL);

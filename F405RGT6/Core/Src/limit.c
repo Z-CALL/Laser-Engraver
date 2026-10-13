@@ -105,6 +105,15 @@ void homing(){
   }
 }
 
+static int goto_point_fail(void)
+{
+    x.lock        = 0;
+    y.lock        = 0;
+    x.divide_step = 0;
+    y.divide_step = 0;
+    return -1;
+}
+
 int goto_point(int x_point,int y_point){
     laser_close();
 	int8_t x_dir = 0;
@@ -135,15 +144,19 @@ int goto_point(int x_point,int y_point){
 	
 	while(1){
 		if(HAL_GPIO_ReadPin(x_limit_r_grop,x_limit_r_pin) == x_limit_r_active){
+			goto_point_fail();
 			return -1;
 		}
 		if(HAL_GPIO_ReadPin(x_limit_l_grop,x_limit_l_pin) == x_limit_l_active){
+			goto_point_fail();
 			return -1;
 		}
 		if(HAL_GPIO_ReadPin(y_limit_d_grop,y_limit_d_pin) == y_limit_d_active){
+			goto_point_fail();
 			return -1;
 		}
 		if(HAL_GPIO_ReadPin(y_limit_u_grop,y_limit_u_pin) == y_limit_u_active){
+			goto_point_fail();
 			return -1;
 		}
 		if(x.lock == 0){
@@ -169,7 +182,6 @@ int goto_point(int x_point,int y_point){
 				if(y_dir == -1){
 					y.cur_point--;
 				}
-				x.divide_step = 0;
 				y.divide_step = 0;
 			}else{
 				y.divide_step++;
@@ -190,6 +202,7 @@ int goto_point(int x_point,int y_point){
 			return 1;
 		}
 		if(times > GOTO_POINT_TIMEOUT){
+			goto_point_fail();
 			return -1;
 		}
 		BSP_DelayUs(40);

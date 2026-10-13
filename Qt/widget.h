@@ -169,6 +169,14 @@ private:
     int           m_monitorGot;        /* 已收到的点数 */
     qint64        m_monitorLastPaintMs;/* 重绘节流 */
 
+    /* ★ 自诊断：把"发出去的首包字节"和"固件回传的前几个灰度"直接对着打出来。
+       目的：一眼分开两种完全不同的故障 ——
+         · 发出去是真实值、回传全是 0  → 固件没吃到我发的包（链路/时序）
+         · 发出去本来就是 0            → 数据被灰度阈值砍光了
+       复现"机器在动但不雕刻、回显全白"时，这两行就是判据。 */
+    QString       m_monitorFirstHex;   /* 固件回传的前若干灰度，累积成串 */
+    bool          m_firstPktAllZero;   /* 本次待发数据的前若干字节是否全 0 */
+
     /* 文件浏览面板 */
     bool           m_fbSaveMode;
     QString        m_fbDir;

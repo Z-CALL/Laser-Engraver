@@ -167,6 +167,12 @@ int main(void)
 	waiting();
 	USART3_RxStart();
 	goto_point(x_work_orgin,y_work_orgin);
+    x.lock        = 0;
+    y.lock        = 0;
+    x.divide_step = 0;
+    y.divide_step = 0;
+	x.add_flag = 0;
+	y.add_flag = 0;
 	x.cur_point = 0;
 	y.cur_point = 0;
 	work_cusor = 0;
