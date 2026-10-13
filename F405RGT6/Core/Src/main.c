@@ -188,7 +188,6 @@ int main(void)
 	
 	RX_write_cusor = 0;
 	
-	
   /* USER CODE END 2 */
 
   /* Infinite loop */
