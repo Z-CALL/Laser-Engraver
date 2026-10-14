@@ -1,5 +1,32 @@
 # Laser-Engraver 项目长期笔记
 
+## ★ TF 卡驱动现状（2026-10-14 改写，最重要）
+
+**`Core/Src/tf_card.c` 现在是 HAL_SD 版（765 行），不再是寄存器版。**
+对外接口 `tf_card.h` 基本没变，所以 `test.c` 的测试台 / OLED 页面不用改。
+
+- **已跑通**：`1 init OK / 2 mbr 55AA / 3 fs FAT16/12 / 4 rep OK /
+  5 speed 5730 KB/s`，`bus/clk: 4bit 24 MHz DMA`，`raw: sta 00000000 line 0`
+  （零错误，`line 0` = 一个 `TF_MARK()` 都没触发）。
+- 旧寄存器版（2800 行）随时可取回：
+  `git show b0e6c05:F405RGT6/Core/Src/tf_card.c`
+- 本工程现在这些是新加的/新启用的：
+  `Core/Src/sdio.c` + `Core/Inc/sdio.h`（CubeMX 生成的 HAL_SD 初始化 +
+  `HAL_SD_MspInit`）、`stm32f4xx_hal_conf.h` 里打开了 `HAL_SD_MODULE_ENABLED`、
+  `stm32f4xx_it.c` 里有 `SDIO_IRQHandler` + `DMA2_Stream3/6_IRQHandler`、
+  `dma.c` 里补了 DMA2 时钟与这两个中断、Keil 工程登记了
+  `sdio.c` / `stm32f4xx_hal_sd.c` / `stm32f4xx_ll_sdmmc.c`。
+- 排查开关：`tf_card.h` 里 **`TF_USE_HAL_DMA`**（默认 1 = DMA 异步版；
+  改 0 = `HAL_SD_ReadBlocks()` 阻塞轮询版，无中断依赖，用来隔离问题）。
+- 本版**不做 CMD6 高速模式**（HAL_SD 没有对应 API）→ 最高 24MHz、
+  `highSpeedMode` 恒 0、报告里 `HS` 显示 `--`，`TF_SetSpeed(48M)` 按 24M 处理。
+- **`g_tfLastSta` 的含义变了**：从 `SDIO->STA` 变成 **`hsd.ErrorCode`**。
+- `TF_INCLUDE_TEST` 已置 0（旧版那套日志轮播没重写，测试统一走 `test.c`）。
+
+★ **教训**：寄存器版走了 4 轮硬件往返才定位到一半问题（ACMD41 的 R3 无 CRC7、
+CSD v1.0 位域、DMA 停流竞态、FIFO 残余），HAL_SD 版**一次就过**。
+下次遇到 SD/TF 卡，先考虑直接上 `HAL_SD`。细节见技能 `stm32-sdio-tf-card`。
+
 ## 结构
 
 - `F405RGT6/` —— STM32F405RGT6 下位机（CubeMX + Keil MDK，HAL 库，裸机）。
@@ -16,7 +43,11 @@
 - 语法自检可行（不需要 Keil）：
   `arm-none-eabi-gcc -fsyntax-only -mcpu=cortex-m4 -mthumb -DUSE_HAL_DRIVER -DSTM32F405xx -Wall -Wextra -ICore/Inc -IDrivers/STM32F4xx_HAL_Driver/Inc -IDrivers/STM32F4xx_HAL_Driver/Inc/Legacy -IDrivers/CMSIS/Device/ST/STM32F4xx/Include -IDrivers/CMSIS/Include Core/Src/xxx.c`
 
-## 已修 bug（2026-10-14）
+## 已修 bug（2026-10-14，★ 属于已被取代的寄存器版）
+
+> ⚠ 下面这些坑都是**寄存器版**踩的。该版本已被 HAL_SD 版取代（见最上面一节），
+> 但**坑本身依然有参考价值** —— 里面的芯片行为、位域、时序结论都是实测出来的，
+> 将来写别的 SDIO/裸寄存器驱动时照样适用。
 
 - **`tf_card.c` 识别卡死（提交 7e210ae + 66139a3）**：`tf_cmd()` 对 ACMD41 的 R3 响应也检查
   CCRCFAIL —— 但 R3 按规范没有 CRC7 字段，SDIO 必然报 CCRCFAIL。
