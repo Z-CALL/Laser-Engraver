@@ -33,7 +33,7 @@ extern uint16_t RASTER_TIM2_PERIOD;
 #define REPLY_TIMEOUT_MS  1000U
 
 //激光使用的定时方式，1代表使用链表定时（可实现多任务定时），0代表使用延时定时（只支持单任务）
-#define TIME_DELAY 0
+#define TIME_DELAY 1
 
 
 
@@ -72,46 +72,46 @@ extern uint16_t RASTER_TIM2_PERIOD;
  *  r、l、u、d分别对应X轴的左右限位、Y轴的上下限位
  *  active分别表示触发限位时限位开关的电平，0 表触发时为低电平，1 表触发时为高电平
  */
-#define x_limit_r_grop GPIOC
-#define x_limit_r_pin GPIO_PIN_3
-#define x_limit_r_active 0
-#define x_limit_l_grop GPIOC
-#define x_limit_l_pin GPIO_PIN_2
-#define x_limit_l_active 0
+#define x_limit_r_grop      GPIOC
+#define x_limit_r_pin       GPIO_PIN_3
+#define x_limit_r_active    0
+#define x_limit_l_grop      GPIOC
+#define x_limit_l_pin       GPIO_PIN_2
+#define x_limit_l_active    0
 
-#define y_limit_d_grop GPIOC
-#define y_limit_d_pin GPIO_PIN_0
-#define y_limit_d_active 1
-#define y_limit_u_grop GPIOC
-#define y_limit_u_pin GPIO_PIN_1
-#define y_limit_u_active 1
+#define y_limit_d_grop      GPIOC
+#define y_limit_d_pin       GPIO_PIN_0
+#define y_limit_d_active    1
+#define y_limit_u_grop      GPIOC
+#define y_limit_u_pin       GPIO_PIN_1
+#define y_limit_u_active    1
 
 /*  
  *  激光引脚的的配置
  */
-#define Laser_grop GPIOA
-#define Laser_pin GPIO_PIN_15
+#define Laser_grop          GPIOA
+#define Laser_pin           GPIO_PIN_15
 
 
 /**************************错误码**************************/
-#define BT_INIT_TIMEOUT 0x10				//蓝牙初始化超时
+#define BT_INIT_TIMEOUT     0x10		//蓝牙初始化超时
 
 
 /**************************通信协议（不建议修改）**************************/
 
 //RX_Ctl的控制位
-#define RX_Gray_Data 	0x11
-#define RX_NewLine		0x22
-#define RX_Ctrl			0x33
-#define TX_Next			0x44
-#define TX_Ctrl			0x55
-#define RX_waiting		0x66
-#define TX_Ready 		0x77
+#define RX_Gray_Data 	    0x11
+#define RX_NewLine		    0x22
+#define RX_Ctrl			    0x33
+#define TX_Next			    0x44
+#define TX_Ctrl			    0x55
+#define RX_waiting		    0x66
+#define TX_Ready 		    0x77
 
 //收到0x33后的信息位
-#define X_ALL_POINT	0x44
-#define Y_ALL_POINT	0x55
-#define WorkSpeed	0x66
+#define X_ALL_POINT	        0x44
+#define Y_ALL_POINT	        0x55
+#define WorkSpeed	        0x66
 
 /* 	
  *	偏移	长		内容
