@@ -414,6 +414,11 @@
               <FilePath>../Core/Src/dma.c</FilePath>
             </File>
             <File>
+              <FileName>sdio.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/sdio.c</FilePath>
+            </File>
+            <File>
               <FileName>i2c.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/i2c.c</FilePath>
@@ -603,6 +608,16 @@
               <FileType>5</FileType>
               <FilePath>..\Core\Inc\Bluetooth.h</FilePath>
             </File>
+            <File>
+              <FileName>tf_card.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\tf_card.c</FilePath>
+            </File>
+            <File>
+              <FileName>tf_card.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\Inc\tf_card.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -662,6 +677,16 @@
               <FileName>stm32f4xx_hal_dma.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_dma.c</FilePath>
+            </File>
+            <File>
+              <FileName>stm32f4xx_hal_sd.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_sd.c</FilePath>
+            </File>
+            <File>
+              <FileName>stm32f4xx_ll_sdmmc.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_ll_sdmmc.c</FilePath>
             </File>
             <File>
               <FileName>stm32f4xx_hal_pwr.c</FileName>

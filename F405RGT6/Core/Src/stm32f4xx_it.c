@@ -21,6 +21,7 @@
 #include "main.h"
 #include "stm32f4xx_it.h"
 #include "usart.h"   /* USART3_DMA_xxxCallback 声明 */
+#include "sdio.h"    /* hsd：HAL_SD 的中断收尾要它 */
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 /* USER CODE END Includes */
@@ -342,6 +343,26 @@ void UART5_IRQHandler(void)
   /* USER CODE BEGIN UART5_IRQn 1 */
 
   /* USER CODE END UART5_IRQn 1 */
+}
+
+
+/**
+  * @brief This function handles SDIO global interrupt.
+  * @note  HAL_SD 的读写靠这个中断收尾（DCRCFAIL / DTIMEOUT / DATAEND 等），
+  *        HAL_SD_MspInit() 里已经把 SDIO_IRQn 打开并设为优先级 0。
+  *        ★ 注意：这是【HAL_SD】这条路用的；
+  *          寄存器版 tf_card.c 不用中断（它自己轮询 SDIO->STA），两者互不干扰，
+  *          但不要同时调用 MX_SDIO_SD_Init() 和 TF_Init()。
+  */
+void SDIO_IRQHandler(void)
+{
+  /* USER CODE BEGIN SDIO_IRQn 0 */
+
+  /* USER CODE END SDIO_IRQn 0 */
+  HAL_SD_IRQHandler(&hsd);
+  /* USER CODE BEGIN SDIO_IRQn 1 */
+
+  /* USER CODE END SDIO_IRQn 1 */
 }
 
 /* USER CODE BEGIN 1 */

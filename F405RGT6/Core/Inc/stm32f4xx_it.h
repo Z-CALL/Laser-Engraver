@@ -58,6 +58,7 @@ void SysTick_Handler(void);
 void DMA1_Stream1_IRQHandler(void);
 void TIM2_IRQHandler(void);
 void UART5_IRQHandler(void);
+void SDIO_IRQHandler(void);
 /* USER CODE BEGIN EFP */
 
 /* USER CODE END EFP */
