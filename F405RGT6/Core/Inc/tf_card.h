@@ -119,36 +119,41 @@ extern "C" {
 #define TF_SPEED_LEVELS     8U
 
 /* ==========================================================================
- * DMA
- *   STM32F405 上 SDIO 只能挂 DMA2：
- *       SDIO_RX -> DMA2_Stream3, Channel 4（卡 → 内存）
- *       SDIO_TX -> DMA2_Stream6, Channel 4（内存 → 卡）
- *   本工程 DMA1 的 Stream1/3 被 USART3 占了，DMA2 完全空闲。
+ * ★ HAL_SD 版（2026-10-14 改写）—— 数据搬运方式
  *
- *   ★ 这里用纯寄存器配 DMA，且【不注册中断】——
- *     DMA 中断服务函数要写进 stm32f4xx_it.c，本驱动的约定是不动它。
- *     轮询 SDIO 自己的 DATAEND/DCRCFAIL 标志一样准确。
+ *   本版把识别/读写都交给 ST 的 HAL_SD，DMA 也由 HAL 管：
+ *       TF_USE_HAL_DMA = 1  -> 用 HAL_SD_ReadBlocks_DMA()/_WriteBlocks_DMA()
+ *                              （异步，靠 SDIO_IRQHandler + DMA2_Stream3/6
+ *                                的中断收尾；速度好，是默认）
+ *       TF_USE_HAL_DMA = 0  -> 用 HAL_SD_ReadBlocks()/_WriteBlocks()
+ *                              （阻塞轮询，CPU 自己搬 FIFO；没有中断依赖，
+ *                                最稳但慢一些。排查问题时可以先切到这个）
  *
- *   改成 0 就退回原来的纯 CPU 轮询搬数（慢一些，但少一层依赖）。 */
-#ifndef TF_USE_DMA
-#define TF_USE_DMA          1
+ *   ★ 出问题时的排查顺序：先切 0 确认 HAL_SD 本身通了，再切回 1 看 DMA。
+ * ========================================================================== */
+#ifndef TF_USE_HAL_DMA
+#define TF_USE_HAL_DMA      1
 #endif
 
-/* DMA 优先级。SDIO 数据流对时序敏感，给次高（避免抢占已有外设的中断优先级） */
+/* ==========================================================================
+ * 下面这些是【旧寄存器版】留下的宏，HAL_SD 版已经不用了，
+ * 但保留着以免别处引用时报错。
+ * ========================================================================== */
+#ifndef TF_USE_DMA
+#define TF_USE_DMA          0
+#endif
+
+/* DMA 优先级（旧版用，HAL 版忽略） */
 #define TF_DMA_PRIORITY     2U      /* 0=低 1=中 2=高 3=最高 */
 
-/* 命令响应超时（毫秒） */
+/* 命令响应超时（毫秒，旧版用；HAL 版由 HAL_SD_Init 内部自己管） */
 #define TF_CMD_TIMEOUT_MS   500U
 
 /* 数据块超时（毫秒），单块 512B @16MHz 约 0.3ms，多块按块数放大 */
 #define TF_DATA_TIMEOUT_PER_BLOCK_MS   50U
 #define TF_DATA_TIMEOUT_MIN_MS         500U
 
-/* ACMD41 轮询上限。
- * 卡上电到 ready 通常几十次就够。★ 每轮里有 HAL_Delay(1)，所以这个数
- * 基本就是"最多等多少毫秒"：原来是 0xFFFFF(≈17 分钟！)，卡要是不 ready
- * 会像死机一样卡在识别里（配合 TF_INIT_RETRY=3 更久）。
- * SD 规范要求卡在上电 1 秒内初始化完成，给 4000(≈4 秒) 已经非常宽裕。 */
+/* ACMD41 轮询上限（旧版用，HAL 版由 HAL_SD_Init 内部自己管） */
 #define TF_ACMD41_TRIES     4000U
 
 /* ==========================================================================
@@ -277,6 +282,7 @@ TF_Status TF_WriteBlocks(uint32_t block, const uint8_t *buf, uint32_t count);
 
 /** 读一块并重试 retry 次（抗偶发 CRC 错，读关键数据时用） */
 TF_Status TF_ReadBlockRetry(uint32_t block, uint8_t *buf, uint32_t retry);
+TF_Status TF_WriteBlockRetry(uint32_t block, const uint8_t *buf, uint32_t retry);
 
 /* ---- 查询 ---- */
 uint32_t TF_BlockCount(void);       /* 总扇区数 */
@@ -336,16 +342,18 @@ void TF_OledShow(TF_Status st, uint8_t y);
 #endif
 
 /* ==========================================================================
- * 测试 / 调试（报告直接显示在 OLED 上）
+ * 测试 / 调试
  *
- * ★ 输出到 OLED：用 6x8 小字体，一行 21 字符、一屏 8 行。
- *   报告先攒进日志缓冲，再分页轮播。
- * ★ 同时会往 USART1(PA9) 镜像一份 —— 引脚没引出来也没关系，
- *   不想要就把 TF_DBG_UART_EN 设成 0，就完全不碰 USART1。
- * ★ 整段可以用宏 TF_INCLUDE_TEST 定义成 0 关掉，不影响驱动本体。
+ * ★★ 2026-10-14 改成 HAL_SD 版时，把这套【旧的日志轮播】关掉了（置 0）：
+ *    它依赖旧寄存器版自己攒的日志缓冲，HAL_SD 版没有重写这部分。
+ *    测试现在统一走 test.c 里的 test_tf_card()（结论页 + USART3 文本报告），
+ *    功能上已经覆盖了原来那套（初始化 / MBR / 文件系统 / 重复读 / 吞吐）。
+ *
+ *    想重新启用就把下面改成 1 —— 但需要先在新版 tf_card.c 里补上
+ *    TF_Test / TF_ShowLog / TF_ShowLastPage / TF_LogLines / TF_LogLine 的实现。
  * ========================================================================== */
 #ifndef TF_INCLUDE_TEST
-#define TF_INCLUDE_TEST     1
+#define TF_INCLUDE_TEST     0
 #endif
 
 #if TF_INCLUDE_TEST
