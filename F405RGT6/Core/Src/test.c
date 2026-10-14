@@ -1,5 +1,6 @@
 #include "test.h"
-#include "tf_card.h"   /* TF_Test / TF_ShowLog / g_tf ... */
+#include "tf_card.h"   /* TF_Init / TF_ReadBlocks / g_tf ... */
+#include <string.h>    /* memcmp / memcpy */
 
 void test_laser_PWM_fre_limit(void)
 {
@@ -88,84 +89,351 @@ void test_go_to_point(){
  *   CLK=PC12  CMD=PD2  D0~D3=PC8~PC11
  * 调用前必须先 OLED_Init()（main.c 里已经有了）。
  *
- * 流程：
- *   [1] 先刷一屏提示，告诉人"在测了"（识别+吞吐测试要跑几秒）
- *   [2] TF_Test(0) 跑完整自检 —— **只读，绝不写卡**：
- *         识别卡 -> 读 0 号扇区查 MBR 签名 55AA -> 读分区引导扇区认文件系统
- *         -> 同一扇区重复读 4 次比对 -> 连读 256 扇区(128KB) x3 用 DWT 测吞吐
- *       报告会自动攒进驱动内部的日志缓冲，结束时驱动自己会刷一次结论页。
- *   [3] 之后进死循环：先显示一屏"结论速览"（8x16 大字，一眼能看清），
- *       再把完整报告用 6x8 小字体分页轮播（每页 2 秒），一直循环，
- *       方便凑近了慢慢翻，不会一闪而过。
+ * ★ 为什么不用驱动自带的 TF_Test()：
+ *   它的吞吐测试把 256 块 = 128KB 读进一个只有 512 字节的缓冲区
+ *   （tf_card.c 里 s_tfBuf[TF_BLOCK_SIZE]），越界 128KB，会把 SRAM1 整片
+ *   踩掉 —— OLED 显存和栈都在里面，表现就是"每隔一会儿花屏一次"。
+ *   所以这里自己按正确尺寸做：单块用 512B，吞吐按 8 块(4KB)一次、分 32 次读。
  *
- * ★ 卡里不需要放任何文件，空卡也能跑（驱动是扇区级的）。
+ * 检查项：
+ *   1 init  TF_Init() 识别卡（含速度协商）
+ *   2 mbr   读 0 号扇区，查 MBR 签名 55AA、取第一个分区起始 LBA
+ *   3 fs    读该分区引导扇区，认 FAT32/exFAT/NTFS
+ *   4 rep   0 号扇区重复读 4 次比对（抓偶发 CRC 错）
+ *   5 spd   连读 128KB，用 DWT 计时算吞吐
  *
- * ★ 想看写测试：把下面的 TF_Test(0U) 改成 TF_Test(1U)。
- *   写测试只动【卡的最后一个扇区】，先备份、写完校验、再把原内容写回，
- *   不会破坏卡上数据。
+ * ★ 全程只读，绝不写卡；卡里不需要放任何文件，空卡也能跑。
+ * ★ 结尾 while(1)：每 3 秒翻一页，一直循环：
+ *     P0 结论    P1 检查项    P2 吞吐 / 卡信息 / 原始诊断
+ *   本函数不返回，只能当独立调试模式用。
  *
- * ★ 本函数不返回（结尾 while(1)），只能当独立调试模式用；
- *   要调用它，在 main.c 的 USER CODE BEGIN 2 里加一行
- *   test_tf_card();   并在 test.h 里补一句原型声明。
+ * ★ 要调用它：main.c 的 USER CODE BEGIN 2 里加一行 test_tf_card();
+ *   并在 test.h 里补一句原型声明 void test_tf_card(void);
  * ========================================================================== */
-void test_tf_card(void)
+
+/* ---- 测试用静态缓冲（不占栈）。4KB 那个给吞吐测试用 ---- */
+static uint8_t t_blk[TF_BLOCK_SIZE]      __attribute__((aligned(4)));
+static uint8_t t_ref[TF_BLOCK_SIZE]      __attribute__((aligned(4)));
+static uint8_t t_big[TF_BLOCK_SIZE * 8U] __attribute__((aligned(4)));
+
+/* ---- 结果暂存（给分页显示用）---- */
+static uint8_t    s_fail;        /* 失败项个数 */
+static uint8_t    s_fail_item;   /* 第一个失败的检查项编号，0 = 全过 */
+static TF_Status  s_fail_st;     /* 第一个失败项返回的状态 */
+static const char *s_init_txt;
+static const char *s_mbr_txt;
+static const char *s_fs_txt;
+static const char *s_rep_txt;
+static const char *s_type_txt;
+static const char *s_bus_txt;
+static const char *s_dma_txt;
+static const char *s_hs_txt;
+static uint32_t   s_kbps;
+static uint32_t   s_tp_us;
+static uint32_t   s_cap_mb;
+static uint32_t   s_blk_cnt;
+static uint32_t   s_clk_mhz;
+static uint32_t   s_err_step;    /* 原始诊断：卡在哪一步 */
+static uint32_t   s_err_sta;     /* 原始诊断：出错瞬间 SDIO->STA */
+static uint32_t   s_err_resp;    /* 原始诊断：出错那条命令的 RESP1 */
+static uint32_t   s_err_line;    /* 原始诊断：出错所在的源文件行号 */
+
+/* DWT 周期计数器（Cortex-M4 内核自带，不占外设） */
+#define T_DWT_DEMCR  (*(volatile uint32_t *)0xE000EDFCUL)
+#define T_DWT_CTRL   (*(volatile uint32_t *)0xE0001000UL)
+#define T_DWT_CYCCNT (*(volatile uint32_t *)0xE0001004UL)
+
+/* 画字的小宏，省得到处写坐标换算。
+   T8 = 8x16 字体（一屏 4 行，16 字符/行）
+   T6 = 6x8  字体（一屏 8 行，21 字符/行） */
+#define T8(row, x, s)      OLED_ShowString((x), (uint8_t)((row) * 16U), (s), OLED_FONT_08, 1U)
+#define T8U(row, x, v, n)  OLED_ShowUNum((x), (uint8_t)((row) * 16U), (v), (n), OLED_FONT_08, 1U)
+#define T8X(row, x, v, n)  OLED_ShowHexNum((x), (uint8_t)((row) * 16U), (v), (n), OLED_FONT_08, 1U)
+#define T6(row, x, s)      OLED_ShowString((x), (uint8_t)((row) * 8U), (s), OLED_FONT_06, 1U)
+#define T6U(row, x, v, n)  OLED_ShowUNum((x), (uint8_t)((row) * 8U), (v), (n), OLED_FONT_06, 1U)
+#define T6X(row, x, v, n)  OLED_ShowHexNum((x), (uint8_t)((row) * 8U), (v), (n), OLED_FONT_06, 1U)
+
+/** 短版状态名（OLED 一行放不下 TF_StatusStr 的长串） */
+static const char *t_st_short(TF_Status st)
 {
-	uint8_t fail;
-
-	/* ---- [1] 提示页 ---- */
-	OLED_Clear();
-	OLED_ShowString(0U,  0U, "TF CARD TEST",  OLED_FONT_08, 1U);
-	OLED_ShowString(0U, 16U, "read only",     OLED_FONT_08, 1U);
-	OLED_ShowString(0U, 32U, "please wait...", OLED_FONT_06, 1U);
-	OLED_Refresh();
-
-	/* ---- [2] 完整自检（只读）。内部结束时会自动刷一次结论页 ---- */
-	fail = TF_Test(0U);
-
-	/* ---- [3] 结论速览 + 完整报告轮播，死循环 ---- */
-	while (1)
+	switch (st)
 	{
-		OLED_Clear();
-		OLED_ShowString(0U, 0U, (fail == 0U) ? "RESULT: PASS" : "RESULT: FAIL",
-		                OLED_FONT_08, 1U);
+	case TF_OK:                 return "OK";
+	case TF_ERR_CMD_TIMEOUT:    return "cTO";
+	case TF_ERR_CMD_CRC:        return "cCRC";
+	case TF_ERR_CMD_RESP:       return "cRSP";
+	case TF_ERR_DATA_TIMEOUT:   return "dTO";
+	case TF_ERR_DATA_CRC:       return "dCRC";
+	case TF_ERR_DATA_FIFO:      return "fifo";
+	case TF_ERR_V2_FAIL:        return "v1";
+	case TF_ERR_VOLTAGE:        return "volt";
+	case TF_ERR_NOT_SD:         return "notSD";
+	case TF_ERR_ADDR_RANGE:     return "range";
+	case TF_ERR_BUS_WIDTH:      return "bus";
+	case TF_ERR_UNSUPPORTED_HS: return "noHS";
+	default:                    return "?";
+	}
+}
 
-		if (fail != 0U)
+/** 记一次失败，并把当时的原始诊断值抓下来（第一个失败项最有用） */
+static void t_fail(uint8_t item, TF_Status st)
+{
+	if (s_fail_item == 0U)
+	{
+		s_fail_item = item;
+		s_fail_st   = st;
+		s_err_step  = g_tfStep;
+		s_err_sta   = g_tfLastSta;
+		s_err_resp  = g_tfLastResp;
+		s_err_line  = g_tfErrLine;
+	}
+	++s_fail;
+}
+
+static void t_dwt_init(void)
+{
+	T_DWT_DEMCR  |= (1UL << 24);        /* TRCENA */
+	T_DWT_CYCCNT  = 0U;
+	T_DWT_CTRL   |= 1UL;                /* CYCCNTENA */
+}
+
+static uint32_t t_dwt_us(uint32_t start)
+{
+	/* 168MHz 下 CYCCNT 约 25.6s 回绕一次，单次测试远短于此 */
+	return (T_DWT_CYCCNT - start) / (SystemCoreClock / 1000000U);
+}
+
+/** 认文件系统（看分区引导扇区里的标志串） */
+static const char *t_fs_name(const uint8_t *bs)
+{
+	if (memcmp(bs + 3U, "EXFAT   ", 8U) == 0)  { return "exFAT"; }
+	if (memcmp(bs + 3U, "NTFS    ", 8U) == 0)  { return "NTFS"; }
+	if (memcmp(bs + 0x52U, "FAT32", 5U) == 0)  { return "FAT32"; }
+	if (memcmp(bs + 0x36U, "FAT", 3U) == 0)    { return "FAT16/12"; }
+	return "unknown";
+}
+
+/** 画一页到 OLED */
+static void t_page(uint8_t p)
+{
+	OLED_Clear();
+
+	if (p == 0U)
+	{
+		/* ---------------- P0 结论 ---------------- */
+		if (s_fail == 0U)
 		{
-			/* 失败：最该看的三个数是 失败项数 / 卡在哪一步 / SDIO->STA */
-			OLED_ShowString(0U, 16U, "fail:", OLED_FONT_08, 1U);
-			OLED_ShowUNum(40U, 16U, fail, 2U, OLED_FONT_08, 1U);
-			OLED_ShowString(64U, 16U, "step:", OLED_FONT_08, 1U);
-			OLED_ShowUNum(104U, 16U, g_tfStep, 2U, OLED_FONT_08, 1U);
-
-			OLED_ShowString(0U, 32U, "sta:", OLED_FONT_08, 1U);
-			OLED_ShowHexNum(32U, 32U, g_tfLastSta, 8U, OLED_FONT_08, 1U);
-
-			OLED_ShowString(0U, 48U, "line:", OLED_FONT_08, 1U);
-			OLED_ShowUNum(40U, 48U, g_tfErrLine, 4U, OLED_FONT_08, 1U);
+			T8(0, 0, "RESULT: PASS");
+			T8(1, 0, "cap");
+			T8U(1, 32, s_cap_mb, 6U);
+			T8(1, 88, "MB");
+			T8(2, 0, s_bus_txt);
+			T8U(2, 40, s_clk_mhz, 2U);
+			T8(2, 56, "MHz");
+			T8(3, 0, s_dma_txt);
+			T8(3, 48, s_hs_txt);
 		}
 		else
 		{
-			/* 成功：容量 / 位宽 / 实测频率 / 数据通道 / 是否高速模式 */
-			OLED_ShowString(0U, 16U, "cap:", OLED_FONT_08, 1U);
-			OLED_ShowUNum(32U, 16U, g_tf.capacityKB / 1024U, 5U, OLED_FONT_08, 1U);
-			OLED_ShowString(72U, 16U, "MB", OLED_FONT_08, 1U);
-
-			OLED_ShowString(0U, 32U, g_tf.bus4bit ? "4bit" : "1bit",
-			                OLED_FONT_08, 1U);
-			OLED_ShowUNum(40U, 32U, g_tf.sdioClkHz / 1000000U, 2U,
-			              OLED_FONT_08, 1U);
-			OLED_ShowString(56U, 32U, "MHz", OLED_FONT_08, 1U);
-
-			OLED_ShowString(0U, 48U, g_tf.dmaUsed ? "DMA" : "CPU",
-			                OLED_FONT_08, 1U);
-			OLED_ShowString(48U, 48U, g_tf.highSpeedMode ? "HS" : "--",
-			                OLED_FONT_08, 1U);
+			T8(0, 0, "RESULT: FAIL");
+			T8(1, 0, "fail");
+			T8U(1, 40, s_fail, 2U);
+			T8(1, 64, "item");
+			T8U(1, 104, s_fail_item, 2U);
+			T8(2, 0, t_st_short(s_fail_st));
+			T8(2, 48, "step");
+			T8U(2, 88, s_err_step, 2U);
+			T8(3, 0, "sta");
+			T8X(3, 32, s_err_sta, 8U);
 		}
-		OLED_Refresh();
-		BSP_DelayMs(3000U);
+	}
+	else if (p == 1U)
+	{
+		/* ---------------- P1 五项检查的结果 ---------------- */
+		T8(0, 0, "1 init"); T8(0, 64, s_init_txt);
+		T8(1, 0, "2 mbr "); T8(1, 64, s_mbr_txt);
+		T8(2, 0, "3 fs  "); T8(2, 64, s_fs_txt);
+		T8(3, 0, "4 rep "); T8(3, 64, s_rep_txt);
+	}
+	else
+	{
+		/* ---------------- P2 吞吐 / 卡信息 / 原始诊断 ---------------- */
+		T6(0,   0, "5 spd"); T6U(0, 48, s_kbps, 5U); T6(0, 88, "KB/s");
+		T6(1,   0, "128KB"); T6U(1, 42, s_tp_us, 7U); T6(1, 88, "us");
+		T6(2,   0, "type");  T6(2, 42, s_type_txt);
+		T6(3,   0, "blk");   T6U(3, 42, s_blk_cnt, 10U);
+		T6(4,   0, "bus");   T6(4, 42, s_bus_txt);
+		T6(4,  78, s_dma_txt);
+		T6(4, 108, s_hs_txt);
+		T6(5,   0, "sta");   T6X(5, 42, s_err_sta, 8U);
+		T6(6,   0, "line");  T6U(6, 30, s_err_line, 4U);
+		T6(6,  66, "step");  T6U(6, 102, s_err_step, 2U);
+		T6(7,   0, "resp");  T6X(7, 30, s_err_resp, 8U);
+	}
 
-		/* 完整报告分页轮播一遍（阻塞），转完回到循环开头继续 */
-		TF_ShowLog(2000U, 1U);
+	OLED_Refresh();
+}
+
+void test_tf_card(void)
+{
+	TF_Status st;
+	uint32_t  t0;
+	uint32_t  partLba;
+	uint8_t   i;
+
+	s_fail      = 0U;
+	s_fail_item = 0U;
+	s_fail_st   = TF_OK;
+	s_init_txt  = "-";
+	s_mbr_txt   = "-";
+	s_fs_txt    = "-";
+	s_rep_txt   = "-";
+	s_type_txt  = "-";
+	s_bus_txt   = "-";
+	s_dma_txt   = "-";
+	s_hs_txt    = "-";
+	s_kbps      = 0U;
+	s_tp_us     = 0U;
+	s_cap_mb    = 0U;
+	s_blk_cnt   = 0U;
+	s_clk_mhz   = 0U;
+	s_err_step  = 0U;
+	s_err_sta   = 0U;
+	s_err_resp  = 0U;
+	s_err_line  = 0U;
+	partLba     = 0U;
+
+	/* ---- 开机提示：识别 + 测试要跑几百毫秒到几秒，先给个反馈 ---- */
+	OLED_Clear();
+	OLED_ShowString(0U,  0U, "TF CARD TEST", OLED_FONT_08, 1U);
+	OLED_ShowString(0U, 16U, "read only",    OLED_FONT_08, 1U);
+	OLED_ShowString(0U, 32U, "please wait",  OLED_FONT_06, 1U);
+	OLED_Refresh();
+
+	t_dwt_init();
+
+	/* ================= [1] 初始化（含速度协商） ================= */
+	st = TF_Init();
+	if (st != TF_OK)
+	{
+		s_init_txt = t_st_short(st);
+		t_fail(1U, st);
+		goto show;              /* 卡都没认出来，后面几项没意义 */
+	}
+	s_init_txt = "OK";
+
+	s_type_txt = (g_tf.cardType == TF_CARD_SDHC) ? "SDHC/SDXC"
+	           : (g_tf.cardType == TF_CARD_SDSC) ? "SDSC" : "unknown";
+	s_cap_mb   = g_tf.capacityKB / 1024U;
+	s_blk_cnt  = g_tf.blockCount;
+	s_bus_txt  = g_tf.bus4bit ? "4bit" : "1bit";
+	s_dma_txt  = g_tf.dmaUsed ? "DMA" : "CPU";
+	s_hs_txt   = g_tf.highSpeedMode ? "HS" : "--";
+	s_clk_mhz  = g_tf.sdioClkHz / 1000000U;
+
+	/* ================= [2] 读 0 号扇区，查 MBR ================= */
+	st = TF_ReadBlockRetry(0U, t_blk, 3U);
+	if (st != TF_OK)
+	{
+		s_mbr_txt = t_st_short(st);
+		t_fail(2U, st);
+		goto show;              /* 连 0 号扇区都读不出来，后面别跑了 */
+	}
+
+	partLba = ((uint32_t)t_blk[446U + 8U])
+	        | ((uint32_t)t_blk[446U + 9U]  << 8U)
+	        | ((uint32_t)t_blk[446U + 10U] << 16U)
+	        | ((uint32_t)t_blk[446U + 11U] << 24U);
+
+	/* 没有 55AA 签名不算失败（裸卡/空卡也这样），读取本身成功就算通 */
+	s_mbr_txt = ((t_blk[510] == 0x55U) && (t_blk[511] == 0xAAU)) ? "55AA" : "noMBR";
+
+	/* ================= [3] 认文件系统 ================= */
+	if ((partLba == 0U) || (partLba >= g_tf.blockCount))
+	{
+		s_fs_txt = "skip";
+	}
+	else
+	{
+		st = TF_ReadBlockRetry(partLba, t_ref, 3U);
+		if (st != TF_OK)
+		{
+			s_fs_txt = t_st_short(st);
+			t_fail(3U, st);
+		}
+		else
+		{
+			s_fs_txt = t_fs_name(t_ref);
+		}
+	}
+
+	/* ================= [4] 重复读一致性 ================= */
+	st = TF_ReadBlockRetry(0U, t_blk, 3U);
+	if (st != TF_OK)
+	{
+		s_rep_txt = t_st_short(st);
+		t_fail(4U, st);
+	}
+	else
+	{
+		for (i = 0U; i < 3U; ++i)
+		{
+			if (TF_ReadBlockRetry(0U, t_ref, 3U) != TF_OK) { break; }
+			if (memcmp(t_blk, t_ref, TF_BLOCK_SIZE) != 0)  { break; }
+		}
+		if (i == 3U)
+		{
+			s_rep_txt = "OK";
+		}
+		else
+		{
+			s_rep_txt = "BAD";
+			t_fail(4U, TF_ERR_DATA_CRC);    /* 内容对不上 = 数据不可信 */
+		}
+	}
+
+	/* ================= [5] 吞吐：连读 128KB =================
+	   8 块 x 512B = 4KB 一次（正好装进 t_big），读 32 次 = 128KB。
+	   一次读多块能摊掉命令开销，比逐块读更接近真实吞吐。 */
+	t0 = T_DWT_CYCCNT;
+	st = TF_OK;
+	for (i = 0U; i < 32U; ++i)
+	{
+		st = TF_ReadBlocks(0U, t_big, 8U);
+		if (st != TF_OK) { break; }         /* 失败立刻停，别耗时间 */
+	}
+	s_tp_us = t_dwt_us(t0);
+
+	if (st != TF_OK)
+	{
+		t_fail(5U, st);
+	}
+	else if (s_tp_us > 0U)
+	{
+		/* 32 次 x 8 块 x 512B = 131072 字节； KB/s = 字节 x 1000 / 微秒 */
+		s_kbps = (32U * 8U * TF_BLOCK_SIZE * 1000U) / s_tp_us;
+	}
+
+show:
+	/* 全部通过时也抓一份原始诊断值 —— 这是驱动"最后一次见到的错"，
+	   多半是速度协商时试高档失败留下的（已被降档处理，不是故障）。 */
+	if (s_fail == 0U)
+	{
+		s_err_step = g_tfStep;
+		s_err_sta  = g_tfLastSta;
+		s_err_resp = g_tfLastResp;
+		s_err_line = g_tfErrLine;
+	}
+
+	/* ================= 分页轮播，死循环 ================= */
+	while (1)
+	{
+		uint8_t p;
+		for (p = 0U; p < 3U; ++p)
+		{
+			t_page(p);
+			BSP_DelayMs(3000U);
+		}
 	}
 }
 
