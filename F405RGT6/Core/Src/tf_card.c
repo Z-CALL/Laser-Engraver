@@ -993,35 +993,65 @@ static TF_Status tf_acmd41(uint32_t *ocr_out)
     return TF_ERR_VOLTAGE;
 }
 
-/** 从 CSD 算出容量与块数 */
+/** 从 CSD 算出容量与块数
+ *
+ *  ★★ 最容易踩的坑：CSD v1.0 和 v2.0 的 C_SIZE 位置【不一样】！
+ *       v1.0: C_SIZE = bits 73:62（12 位）、C_SIZE_MULT = bits 49:47
+ *       v2.0: C_SIZE = bits 69:48（22 位）、没有 C_SIZE_MULT
+ *     两个版本只差几位，写错了照样能算出个"看起来像容量"的数，
+ *     所以必须先用 CSD_STRUCTURE 分版本，再套对应的位域。
+ *     READ_BL_LEN 两个版本都是 bits 83:80（这个不变）。
+ */
 static void tf_parse_csd(const uint32_t *csd)
 {
-    if (g_tf.cardType == TF_CARD_SDHC)
+    /* ★ 版本直接看 CSD 自己的 bits 127:126（CSD_STRUCTURE）：
+         0 = v1.0（标准容量 SDSC）、1 = v2.0（高容量 SDHC/SDXC）、
+         2/3 = 更新版本，按 v2.0 处理。
+       ★ 以 CSD 为准、而不是只看 OCR 的 CCS 位：两者不一致时 CSD 更可靠，
+         顺手把 cardType 也纠正过来 —— 后面读写的"块地址 / 字节地址"
+         是照 cardType 走的，错了就全错。 */
+    const uint32_t csd_ver = (csd[0] >> 30U) & 0x3U;
+
+    if (csd_ver >= 1U)
     {
-        /* CSD v2.0：C_SIZE 是 22 位
-           C_SIZE = ((CSD[1] & 0x3F) << 16) | ((CSD[2] & 0xFFFF0000) >> 16)
+        /* ---- CSD v2.0：C_SIZE 22 位，块大小固定 512B，没有 C_SIZE_MULT ----
+           C_SIZE = CSD bits 69:48
+                  = ((CSD[1] & 0x3F) << 16) | ((CSD[2] & 0xFFFF0000) >> 16)
            容量 = (C_SIZE + 1) * 512KB（512KB = 1024 个 512B 块） */
         const uint32_t c_size = ((csd[1] & 0x0000003FU) << 16U)
                               | ((csd[2] & 0xFFFF0000U) >> 16U);
+
+        g_tf.cardType   = TF_CARD_SDHC;
         g_tf.blockCount = (c_size + 1U) * 1024U;
     }
     else
     {
-        /* CSD v1.0：
-           C_SIZE = ((CSD[1] & 0x3FF) << 2) | ((CSD[2] & 0xC0000000) >> 30)
-           C_SIZE_MULT = (CSD[2] & 0x38000) >> 15
-           READ_BL_LEN = CSD[1] & 0xF
-           块数 = (C_SIZE+1) * 2^(C_SIZE_MULT+2)
-           块大小 = 2^READ_BL_LEN */
+        /* ---- CSD v1.0 ----
+           C_SIZE      = CSD bits 73:62 = ((CSD[1] & 0x3FF) << 2) | (CSD[2] >> 30)
+           C_SIZE_MULT = CSD bits 49:47 = (CSD[2] >> 15) & 0x7
+           READ_BL_LEN = CSD bits 83:80 = (CSD[1] >> 16) & 0xF
+           块数   = (C_SIZE+1) * 2^(C_SIZE_MULT+2)
+           块大小 = 2^READ_BL_LEN
+
+           ★★ 这里原来是 `csd[1] & 0xF`，取的是 CSD bits 67:64 ——
+              那几位其实属于 C_SIZE（v1.0 里 C_SIZE = bits 73:62），
+              根本不是 READ_BL_LEN。于是算出的块大小 < 512B，
+              折算成 512B 逻辑块时变成 0 -> blockCount = 0 ->
+              TF_Init() 报 TF_ERR_NOT_SD（现象：step 9 / cmd9）。 */
         const uint32_t c_size  = ((csd[1] & 0x000003FFU) << 2U)
                                | ((csd[2] & 0xC0000000U) >> 30U);
         const uint32_t mult    = (csd[2] & 0x00038000U) >> 15U;
-        const uint32_t bl_len  = csd[1] & 0x0000000FU;
+        const uint32_t bl_len  = (csd[1] >> 16U) & 0x0000000FU;
         const uint32_t n_blk   = (c_size + 1U) * (1UL << (mult + 2U));
         const uint32_t bl_size = (1UL << bl_len);
 
-        /* 统一折算成 512 字节的"逻辑块" */
-        g_tf.blockCount = n_blk * (bl_size / TF_BLOCK_SIZE);
+        g_tf.cardType = TF_CARD_SDSC;
+
+        /* 统一折算成 512 字节的"逻辑块"。
+           万一 READ_BL_LEN < 9（块比 512B 还小，规范上不该出现），
+           按 1 个逻辑块算 —— 别让结果变成 0 又被判成"不是 SD 卡"。 */
+        g_tf.blockCount = n_blk * ((bl_size >= TF_BLOCK_SIZE)
+                                   ? (bl_size / TF_BLOCK_SIZE) : 1U);
     }
 
     g_tf.capacityKB = (g_tf.blockCount / 2U);   /* 2 个 512B 块 = 1KB */
@@ -1150,6 +1180,11 @@ static TF_Status tf_identify(void)
         return st;
     }
     tf_get_resp4(csd);
+    /* 诊断：原始 CSD 留一份，容量不对时可以手工解码核对位域 */
+    g_tf.csd[0] = csd[0];
+    g_tf.csd[1] = csd[1];
+    g_tf.csd[2] = csd[2];
+    g_tf.csd[3] = csd[3];
     tf_parse_csd(csd);
 
     if (g_tf.blockCount == 0U)
@@ -1268,6 +1303,10 @@ TF_Status TF_Init(void)
     g_tf.speedAuto   = 1U;
     g_tf.highSpeedMode = 0U;
     g_tf.bypass      = 0U;
+    g_tf.csd[0]      = 0U;
+    g_tf.csd[1]      = 0U;
+    g_tf.csd[2]      = 0U;
+    g_tf.csd[3]      = 0U;
 
     g_tfLastSta  = 0U;
     g_tfLastResp = 0U;

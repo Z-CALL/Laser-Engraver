@@ -348,6 +348,11 @@ static void t_uart_report(void)
 	t_u_str("raw    : sta "); t_u_hex(s_err_sta);
 	t_u_str(" line ");        t_u_num(s_err_line);
 	t_u_str(" resp ");        t_u_hex(s_err_resp); t_u_str("\r\n");
+	/* CMD9 读回的原始 CSD（4 个字）。容量算错时拿这行手工解码核对位域。 */
+	t_u_str("csd    : "); t_u_hex(g_tf.csd[0]); t_u_str(" ");
+	                      t_u_hex(g_tf.csd[1]); t_u_str(" ");
+	                      t_u_hex(g_tf.csd[2]); t_u_str(" ");
+	                      t_u_hex(g_tf.csd[3]); t_u_str("\r\n");
 	t_u_str("oled   : ram bad "); t_u_num(s_oled_bad);
 	t_u_str(" i2c bad ");         t_u_num(s_oled_i2c_bad); t_u_str("\r\n");
 }

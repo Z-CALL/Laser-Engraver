@@ -204,6 +204,12 @@ typedef struct
     uint8_t  negedge;       /* 1 = 时钟用下降沿相位（BYPASS 时为 1） */
     uint8_t  reserved2[2];
     uint32_t speedTriedMask;/* 诊断：试过哪几档（bit0=48M ... 见 TF_SPEED_xxx） */
+
+    /* 诊断：CMD9 读回的原始 CSD（128 位）。
+       csd[0] = CSD bits 127:96，csd[3] = bits 31:0。
+       ★ 容量算得不对时，把这 4 个字打出来手工解码最快 ——
+         CSD v1.0 和 v2.0 的 C_SIZE 位置不一样，光看结果猜不出来。 */
+    uint32_t csd[4];
 } TF_Info;
 
 extern TF_Info g_tf;
