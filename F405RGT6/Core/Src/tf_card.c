@@ -181,6 +181,9 @@ volatile uint32_t g_tfStep    = TF_STEP_NONE;
 volatile uint32_t g_tfLastSta = 0U;
 volatile uint32_t g_tfErrLine = 0U;
 volatile uint32_t g_tfLastResp = 0U;    /* 出错时那条命令的响应原值 */
+volatile uint32_t g_tfDmaLeft  = 0U;    /* 诊断：DMA 读最后一次还剩几个 32 位字没搬 */
+volatile uint32_t g_tfDmaFifo  = 0U;    /* 诊断：停流瞬间 SDIO->FIFOCNT（FIFO 里的字数） */
+volatile uint32_t g_tfDmaIsr   = 0U;    /* 诊断：停流瞬间 DMA2->LISR 的原值（看有没有 TEIF 等） */
 
 /* 私有 */
 static uint32_t  s_sdioClkSrcHz = 48000000U;   /* 反推出来的 PLL48CLK */
@@ -694,34 +697,85 @@ static void tf_dma_stop(uint32_t mem_to_periph)
 }
 
 /**
- * 等一条 DMA 流真的把 NDTR 走完（返回 1 = 走完，0 = 超时）。
+ * 停一条 DMA 流，并把 FIFO 里"没被 DMA 取走"的尾巴交给 CPU 补完。
  *
- * ★★ 为什么必须等 —— 这是个非常阴的坑：
- *    SDIO 的 DATAEND 是按"SDIDCOUNT 归零"置位的，而 DCOUNT 归零只说明
- *    数据【进了 SDIO 自己的 FIFO】，不代表 DMA 已经把它写进内存。
- *    此刻若立刻 tf_dma_stop()（往 CR 写 0），就会把还在跑的流【掐掉】，
- *    块尾最后几个字永远留在 FIFO 里丢掉。
+ * ★★ 为什么要补 —— SDIO + DMA 最经典的一个坑：
+ *    SDIO 的 RX DMA 请求是按"RX FIFO 攒到 8 个字"（RXFIFOHF）发的。
+ *    数据阶段结束时 FIFO 里往往还剩最后几个字（不足 8 个），
+ *    这个请求就再也不会来了 —— NDTR 永远停在非 0 上，
+ *    块尾那几十个字节就留在 FIFO 里被丢掉。
  *
- * ★★ 丢了尾巴【不会报任何错】，所以极难查：
- *    - DMA 模式下 remaining 被无条件置 0，长度检查形同虚设；
- *    - 数据 CRC 是硬件按"进了 FIFO 的字节"算的，照样通过；
- *    - 反复读同一块，每次都丢同样多，一致性测试也发现不了。
- *    表现就是"块尾是缓冲区里的旧数据"。
- *    典型症状：MBR 的 55AA 签名没了（块 0 的 510/511 正好是最后 2 字节），
- *    但同一块靠前的分区表项又是对的 —— 看着像"卡没有 MBR"。
+ *    典型症状：MBR 的 55AA 没了（块 0 的 510/511 正好是最后 2 字节），
+ *    但同一块靠前的内容全是对的 —— 看着像"这张卡没有 MBR"。
+ *
+ * ★ 为什么必须用 FIFOCNT 对账：不能光凭"NDTR 非 0"就认定残余在 FIFO 里。
+ *   只有 FIFOCNT == NDTR（FIFO 里确实躺着这么多个字）才敢补；
+ *   对不上说明是别的问题，宁可报错也不能瞎填 —— 填错比丢掉更难查。
+ *
+ * 返回：1 = 正常（DMA 搬完，或残余已补进 buf）；0 = 数据不可信。
+ *       *drained 带回残余的 32 位字数（0 = DMA 本来就搬完了），供诊断。
  */
-static uint8_t tf_dma_wait_done(uint32_t mem_to_periph, uint32_t to_ms)
+static uint8_t tf_dma_stop_and_drain(uint32_t mem_to_periph, uint8_t *buf,
+                                     uint32_t words, uint32_t *drained)
 {
     DMA_Stream_TypeDef *stream = mem_to_periph ? TF_DMA_TX_STREAM : TF_DMA_RX_STREAM;
-    const uint32_t      t0     = HAL_GetTick();
+    uint32_t left;
+    uint32_t in_fifo;
+    uint32_t i;
+    uint32_t *dst;
 
-    while (stream->NDTR != 0U)
+    *drained = 0U;
+
+    stream->CR = 0U;
+    while ((stream->CR & DMA_SxCR_EN) != 0U)
     {
-        if ((HAL_GetTick() - t0) > to_ms)
-        {
-            return 0U;
-        }
+        /* 等硬件把 EN 清掉 */
     }
+
+    if (mem_to_periph != 0U)
+    {
+        TF_DMA->HIFCR = TF_DMA_CLR_TX;
+    }
+    else
+    {
+        TF_DMA->LIFCR = TF_DMA_CLR_RX;
+    }
+
+    /* 写方向不存在"残余在 FIFO 里"这回事（FIFO 是 DMA 灌给 SDIO 的），
+       停流即可。 */
+    if (mem_to_periph != 0U)
+    {
+        return 1U;
+    }
+
+    left    = (uint32_t)stream->NDTR;                    /* DMA 说还剩几个字没搬 */
+    in_fifo = (uint32_t)(SDIO->FIFOCNT & 0x00FFFFFFU);   /* FIFO 里实际有几个字 */
+
+    *drained   = left;
+    g_tfDmaFifo = in_fifo;
+
+    if (left == 0U)
+    {
+        return 1U;                                       /* DMA 真的搬完了 */
+    }
+    if ((left > words) || (in_fifo < left))
+    {
+        return 0U;                                       /* 说不通，数据不可信 */
+    }
+
+    /* FIFO 里如果比 left 还多几个字，多出来的在【前端】（不该有的残留），
+       先读掉丢弃；剩下 left 个就是这一段的最后 left 个字，按顺序补到末尾。 */
+    for (i = 0U; i < (in_fifo - left); ++i)
+    {
+        (void)SDIO->FIFO;
+    }
+
+    dst = ((uint32_t *)buf) + (words - left);
+    for (i = 0U; i < left; ++i)
+    {
+        *dst++ = SDIO->FIFO;
+    }
+
     return 1U;
 }
 
@@ -1343,6 +1397,9 @@ TF_Status TF_Init(void)
     g_tfLastSta  = 0U;
     g_tfLastResp = 0U;
     g_tfErrLine  = 0U;
+    g_tfDmaLeft  = 0U;
+    g_tfDmaFifo  = 0U;
+    g_tfDmaIsr   = 0U;
 
     /* DMA2 先准备好（SDIO 只能挂 DMA2） */
     tf_dma_init();
@@ -1417,6 +1474,7 @@ TF_Status TF_ReadBlocks(uint32_t block, uint8_t *buf, uint32_t count)
     uint32_t  w;
     uint32_t  use_dma;
     uint32_t  dma_bad;
+    uint32_t  dma_left;
     uint8_t  *p = buf;
 
     if ((buf == 0) || (count == 0U))
@@ -1451,7 +1509,8 @@ TF_Status TF_ReadBlocks(uint32_t block, uint8_t *buf, uint32_t count)
        ★ DMA 的 MSIZE 是 32 位，要求内存地址 4 字节对齐。
          这里不报错，而是静默退回 CPU 轮询路径 —— 调用方不用关心对齐。 */
     use_dma = ((TF_USE_DMA != 0) && (((uint32_t)buf & 3U) == 0U)) ? 1U : 0U;
-    dma_bad = 0U;
+    dma_bad  = 0U;
+    dma_left = 0U;
 
     /* ---- 配数据路径（读：read_from_card=1 -> DTDIR=1）---- */
     tf_data_config(total, 1U, use_dma);
@@ -1496,14 +1555,17 @@ TF_Status TF_ReadBlocks(uint32_t block, uint8_t *buf, uint32_t count)
         sta = tf_wait_sta(SDIO_STA_RXOVERR | SDIO_STA_DCRCFAIL |
                           SDIO_STA_DTIMEOUT | SDIO_STA_STBITERR |
                           SDIO_STA_DATAEND, to_ms);
-        /* ★★ DATAEND 只说明数据进了 SDIO 的 FIFO。必须再等 DMA 把 NDTR
-           走完才能停流，否则块尾几个字会被 tf_dma_stop() 掐掉丢掉
-           （丢尾巴不报错，见 tf_dma_wait_done 的说明）。 */
-        if (tf_dma_wait_done(0U, to_ms) == 0U)
+        /* ★★ 停流 + 把 DMA 没取走的尾巴补上。
+           DATAEND 只说明数据进了 SDIO 的 FIFO；而 SDIO 只在 FIFO 攒到 8 个字
+           时才发 DMA 请求，所以最后不足 8 个字的尾巴会永远留在 FIFO 里。
+           停流后由 CPU 按 NDTR 把这几个字补进缓冲区末尾。
+           （见 tf_dma_stop_and_drain 的说明） */
+        g_tfDmaIsr = TF_DMA->LISR;      /* 诊断：停流前先抓一眼 DMA 状态 */
+        if (tf_dma_stop_and_drain(0U, buf, total / 4U, &dma_left) == 0U)
         {
             dma_bad = 1U;
         }
-        tf_dma_stop(0U);
+        g_tfDmaLeft = dma_left;
         remaining = 0U;             /* DMA 模式不看这个计数 */
     }
     else
@@ -1707,7 +1769,6 @@ TF_Status TF_WriteBlocks(uint32_t block, const uint8_t *buf, uint32_t count)
     uint32_t  i;
     uint32_t  w;
     uint32_t  use_dma;
-    uint32_t  dma_bad;
     const uint8_t *p = buf;
 
     if ((buf == 0) || (count == 0U))
@@ -1740,7 +1801,6 @@ TF_Status TF_WriteBlocks(uint32_t block, const uint8_t *buf, uint32_t count)
 
     /* ---- 选搬运方式（DMA 要 4 字节对齐）---- */
     use_dma = ((TF_USE_DMA != 0) && (((uint32_t)buf & 3U) == 0U)) ? 1U : 0U;
-    dma_bad = 0U;
 
     /* ---- 配数据路径（写：read_from_card=0 -> DTDIR=0，控制器→卡）---- */
     tf_data_config(total, 0U, use_dma);
@@ -1783,11 +1843,8 @@ TF_Status TF_WriteBlocks(uint32_t block, const uint8_t *buf, uint32_t count)
         sta = tf_wait_sta(SDIO_STA_TXUNDERR | SDIO_STA_DCRCFAIL |
                           SDIO_STA_DTIMEOUT | SDIO_STA_STBITERR |
                           SDIO_STA_DATAEND, to_ms);
-        /* 和读路径同理：确认 DMA 真的把 NDTR 走完再停流 */
-        if (tf_dma_wait_done(1U, to_ms) == 0U)
-        {
-            dma_bad = 1U;
-        }
+        /* 写方向不存在"FIFO 残余"问题（FIFO 是 DMA 灌给 SDIO 的，
+           DATAEND 时 DMA 必然已经喂完），停流即可，不做 CPU 补数。 */
         tf_dma_stop(1U);
         words_sent = words_total;       /* DMA 搬完就是全部搬完 */
     }
@@ -1856,7 +1913,7 @@ TF_Status TF_WriteBlocks(uint32_t block, const uint8_t *buf, uint32_t count)
     }
 
     /* 灌的字数必须正好对上，少一个字都说明数据不完整 */
-    if ((words_sent != words_total) || (dma_bad != 0U))
+    if (words_sent != words_total)
     {
         TF_MARK(__LINE__); g_tfLastSta = sta;
         return TF_ERR_DATA_TIMEOUT;

@@ -378,6 +378,12 @@ static void t_uart_report(void)
 	t_u_str("blk0tail: ");
 	for (i = 0U; i < 16U; ++i) { t_u_b(s_tail[i]); }
 	t_u_str("\r\n");
+	/* DMA 收尾诊断：left = 停流时还剩几个 32 位字没被 DMA 搬走（已由 CPU 补回）；
+	   fifo = 同一时刻 FIFO 里的字数。left>0 且 fifo==left 就是命中了
+	   "SDIO 只在 FIFO 攒够 8 个字才发 DMA 请求"那个坑。 */
+	t_u_str("dmadbg : left "); t_u_num(g_tfDmaLeft);
+	t_u_str(" words, fifo ");  t_u_num(g_tfDmaFifo);
+	t_u_str(", LISR ");        t_u_hex(g_tfDmaIsr); t_u_str("\r\n");
 	t_u_str("oled   : ram bad "); t_u_num(s_oled_bad);
 	t_u_str(" i2c bad ");         t_u_num(s_oled_i2c_bad); t_u_str("\r\n");
 }

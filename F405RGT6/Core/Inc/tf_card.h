@@ -214,6 +214,15 @@ typedef struct
 
 extern TF_Info g_tf;
 
+/* 诊断：DMA 读的收尾情况（判断"块尾是不是被 DMA 漏掉、由 CPU 补回"）
+     g_tfDmaLeft : 最后一次 DMA 读结束后，还剩几个 32 位字没被 DMA 搬走
+                   （>0 且已由 CPU 补进缓冲区 = 就是那个"FIFO 残余"问题）
+     g_tfDmaFifo : 同一时刻 SDIO->FIFOCNT 的值（FIFO 里实际有几个字）
+     g_tfDmaIsr  : 停流瞬间 DMA2->LISR 的原值，看有没有 TEIF/DMEIF/FEIF */
+extern volatile uint32_t g_tfDmaLeft;
+extern volatile uint32_t g_tfDmaFifo;
+extern volatile uint32_t g_tfDmaIsr;
+
 /* 诊断用全局量（出错时看这两个就知道走到哪一步了）：
      g_tfStep    : 初始化进度，见 TF_STEP_xxx 注释
      g_tfLastSta : 出错瞬间 SDIO->STA 的原始值（看哪个标志置位就知原因）
