@@ -17,6 +17,7 @@ void test_laser_PWM_fre_limit_24V(void);
 void test_delay();
 void test_homing();
 void test_go_to_point();
+void test_tf_card(void);
 
 #ifdef __cplusplus
 }

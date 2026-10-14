@@ -31,7 +31,8 @@
 /* USER CODE BEGIN Includes */
 #include <string.h>   /* memcpy */
 #include "oled.h"
-#include "test.h"     /* test_laser_PWM_fre_limit() —— 里面还会带上 laser/bsp_delay/oled */
+#include "test.h"
+#include "tf_card.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -136,6 +137,8 @@ int main(void)
   OLED_Init();
   
   laser_close();
+  
+  test_tf_card(); 
   
   //test_laser_PWM_fre_limit_24V();
   homing();
