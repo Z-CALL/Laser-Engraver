@@ -1,5 +1,6 @@
 #include "test.h"
 #include "tf_card.h"   /* TF_Init / TF_ReadBlocks / g_tf ... */
+#include "usart.h"     /* huart3（蓝牙口，测试时闲着，拿来做串口镜像） */
 #include <string.h>    /* memcmp / memcpy */
 
 void test_laser_PWM_fre_limit(void)
@@ -156,13 +157,16 @@ static uint8_t    s_oled_wait;   /* 1 = 有一页等着校验 */
 
 /* 画字的小宏，省得到处写坐标换算。
    T8 = 8x16 字体（一屏 4 行，16 字符/行）
-   T6 = 6x8  字体（一屏 8 行，21 字符/行） */
-#define T8(row, x, s)      OLED_ShowString((x), (uint8_t)((row) * 16U), (s), OLED_FONT_08, 1U)
+   T6 = 6x8  字体（一屏 8 行，21 字符/行） */#define T8(row, x, s)      OLED_ShowString((x), (uint8_t)((row) * 16U), (s), OLED_FONT_08, 1U)
 #define T8U(row, x, v, n)  OLED_ShowUNum((x), (uint8_t)((row) * 16U), (v), (n), OLED_FONT_08, 1U)
 #define T8X(row, x, v, n)  OLED_ShowHexNum((x), (uint8_t)((row) * 16U), (v), (n), OLED_FONT_08, 1U)
 #define T6(row, x, s)      OLED_ShowString((x), (uint8_t)((row) * 8U), (s), OLED_FONT_06, 1U)
 #define T6U(row, x, v, n)  OLED_ShowUNum((x), (uint8_t)((row) * 8U), (v), (n), OLED_FONT_06, 1U)
 #define T6X(row, x, v, n)  OLED_ShowHexNum((x), (uint8_t)((row) * 8U), (v), (n), OLED_FONT_06, 1U)
+
+/* 轮播页数。★ 必须和 t_page() 里画的分支数一致：
+   写成 6 而只定义了 5 页时，最后那页会被连着画两遍。 */
+#define T_PAGES  5U
 
 /** 短版状态名（OLED 一行放不下 TF_StatusStr 的长串） */
 static const char *t_st_short(TF_Status st)
@@ -257,6 +261,100 @@ static uint32_t t_oled_sum(void)
 	}
 	return s;
 }
+
+/* ==========================================================================
+ * 串口镜像（可选）
+ * ★ 用 USART3 —— 就是蓝牙那个口（115200 8N1）。测试时蓝牙没在跑，正好
+ *   拿来抓完整日志：屏幕上放不下的原始值都从这里出，接个 USB-TTL
+ *   就能直接复制粘贴，不用拍屏。
+ *   想换成 PA9 的 USART1 就把 T_UART_HANDLE 改成 huart1；
+ *   整个不要就把 TF_TEST_UART 设成 0。
+ * ========================================================================== */
+#ifndef TF_TEST_UART
+#define TF_TEST_UART    1
+#endif
+
+#define T_UART_HANDLE   huart3
+
+#if TF_TEST_UART
+
+static void t_u_str(const char *s)
+{
+	uint16_t n = 0U;
+
+	while (s[n] != '\0') { ++n; }
+	if (n > 0U)
+	{
+		(void)HAL_UART_Transmit(&T_UART_HANDLE, (const uint8_t *)s, n, 100U);
+	}
+}
+
+static void t_u_num(uint32_t v)
+{
+	char    b[12];
+	char    o[12];
+	uint8_t n = 0U;
+	uint8_t i;
+
+	if (v == 0U) { b[n++] = '0'; }
+	while ((v > 0U) && (n < 11U))
+	{
+		b[n++] = (char)('0' + (v % 10U));
+		v /= 10U;
+	}
+	for (i = 0U; i < n; ++i) { o[i] = b[n - 1U - i]; }
+	(void)HAL_UART_Transmit(&T_UART_HANDLE, (const uint8_t *)o, n, 100U);
+}
+
+static void t_u_hex(uint32_t v)
+{
+	static const char hx[16] = {'0','1','2','3','4','5','6','7',
+	                            '8','9','A','B','C','D','E','F'};
+	char    o[8];
+	uint8_t i;
+
+	for (i = 0U; i < 8U; ++i)
+	{
+		o[i] = hx[(v >> ((7U - i) * 4U)) & 0x0FU];
+	}
+	(void)HAL_UART_Transmit(&T_UART_HANDLE, (const uint8_t *)o, 8U, 100U);
+}
+
+/** 把报告打成文本从串口发出去：屏幕上有的都有，外加几个屏幕上放不下的 */
+static void t_uart_report(void)
+{
+	t_u_str("\r\n=== TF CARD TEST ===\r\n");
+	t_u_str("result : "); t_u_str((s_fail == 0U) ? "PASS" : "FAIL"); t_u_str("\r\n");
+	if (s_fail != 0U)
+	{
+		t_u_str("fail   : "); t_u_num(s_fail);
+		t_u_str(" item ");    t_u_num(s_fail_item);  t_u_str("\r\n");
+		t_u_str("status : "); t_u_str(t_st_short(s_fail_st)); t_u_str("\r\n");
+		t_u_str("step   : "); t_u_num(s_err_step);
+		t_u_str(" ");         t_u_str(t_step_name(s_err_step)); t_u_str("\r\n");
+	}
+	t_u_str("1 init : ");  t_u_str(s_init_txt); t_u_str("\r\n");
+	t_u_str("2 mbr  : ");  t_u_str(s_mbr_txt);  t_u_str("\r\n");
+	t_u_str("3 fs   : ");  t_u_str(s_fs_txt);   t_u_str("\r\n");
+	t_u_str("4 rep  : ");  t_u_str(s_rep_txt);  t_u_str("\r\n");
+	t_u_str("5 speed: ");  t_u_num(s_kbps); t_u_str(" KB/s, ");
+	                       t_u_num(s_tp_us); t_u_str(" us /128KB\r\n");
+	t_u_str("type   : ");  t_u_str(s_type_txt); t_u_str("\r\n");
+	t_u_str("blocks : ");  t_u_num(s_blk_cnt);  t_u_str("\r\n");
+	t_u_str("bus/clk: ");  t_u_str(s_bus_txt);  t_u_str(" ");
+	                       t_u_num(s_clk_mhz);  t_u_str(" MHz ");
+	                       t_u_str(s_dma_txt);  t_u_str(" ");
+	                       t_u_str(s_hs_txt);   t_u_str("\r\n");
+	t_u_str("raw    : sta "); t_u_hex(s_err_sta);
+	t_u_str(" line ");        t_u_num(s_err_line);
+	t_u_str(" resp ");        t_u_hex(s_err_resp); t_u_str("\r\n");
+	t_u_str("oled   : ram bad "); t_u_num(s_oled_bad);
+	t_u_str(" i2c bad ");         t_u_num(s_oled_i2c_bad); t_u_str("\r\n");
+}
+
+#else
+#define t_uart_report()   do { } while (0)
+#endif
 
 /** 认文件系统（看分区引导扇区里的标志串） */
 static const char *t_fs_name(const uint8_t *bs)
@@ -505,12 +603,17 @@ show:
 		s_err_line = g_tfErrLine;
 	}
 
-	/* ================= 分页轮播，死循环 ================= */
+	/* 报告也从串口发一份（USART3 = 蓝牙口，测试时闲着） */
+	t_uart_report();
+
+	/* ================= 分页轮播，死循环 =================
+	   ★ 页数必须和 t_page() 里定义的分支数一致（现在是 5 个）：
+	     写成 6 的时候最后那页会被重复画一遍。 */
 	while (1)
 	{
 		uint8_t p;
 
-		for (p = 0U; p < 6U; ++p)
+		for (p = 0U; p < T_PAGES; ++p)
 		{
 			/* 上一页已经静止了 2.5 秒，先验一下显存有没有被谁踩过 */
 			if (s_oled_wait != 0U)
@@ -530,6 +633,9 @@ show:
 
 			BSP_DelayMs(2500U);
 		}
+
+		/* 每转完一圈再发一份，什么时候接上串口都能抓到 */
+		t_uart_report();
 	}
 }
 

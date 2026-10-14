@@ -504,22 +504,33 @@ static TF_Status tf_cmd_ex(uint8_t idx, uint32_t arg, uint32_t resp, uint32_t to
     if ((sta & SDIO_STA_CTIMEOUT) != 0U)
     {
         TF_MARK(__LINE__);
-        g_tfLastSta = sta;
+        g_tfLastSta = sta;      /* 超时的话 RESP1 没意义，不记 */
         return TF_ERR_CMD_TIMEOUT;
     }
+
     if ((sta & SDIO_STA_CCRCFAIL) != 0U)
     {
-        /* ★ R2（长响应）和显式声明 no_crc 的命令（R3/ACMD41）按规范没有
-           可校验的 CRC7，这里的 CCRCFAIL 是假警报：清掉继续，
-           响应内容（RESP1..4）照样是有效的，由调用方判断内容对不对。 */
+        g_tfLastResp = SDIO->RESP1;     /* 诊断：把当时的响应原值留下来 */
+
+        /* ★★ R2（CMD2/CMD9 的长响应）和 R3（ACMD41 返回的 OCR）按规范
+           没有可校验的 CRC7。这种情况外设【只置 CCRCFAIL，不置 CMDREND】，
+           所以 CCRCFAIL 本身就是"响应已经到了"的信号 ——
+           既不能当成错误，也不能清完标志再回头去等 CMDREND
+           （那样会误报 cTO，见 line 525 那一支）。
+           ST 的 HAL 在 SDMMC_GetCmdResp2()/GetCmdResp3() 里也是直接清掉
+           这个标志、当成功处理。响应内容照样在 RESP1..4 里，
+           由调用方自己判断内容对不对（ACMD41 那边看 OCR 的 bit31/bit30）。 */
         if ((no_crc == 0U) && (resp != TF_RESP_LONG))
         {
             TF_MARK(__LINE__);
             g_tfLastSta = sta;
-            return TF_ERR_CMD_CRC;
+            return TF_ERR_CMD_CRC;      /* R1/R6/R7 带真 CRC7：这确实是错 */
         }
+
         SDIO->ICR = SDIO_STA_CCRCFAIL;
+        return TF_OK;                   /* 放宽的场合：到这里就算收到了 */
     }
+
     if ((sta & SDIO_STA_CMDREND) == 0U)
     {
         TF_MARK(__LINE__);
