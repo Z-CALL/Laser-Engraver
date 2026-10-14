@@ -138,6 +138,17 @@ static uint32_t   s_err_sta;     /* 原始诊断：出错瞬间 SDIO->STA */
 static uint32_t   s_err_resp;    /* 原始诊断：出错那条命令的 RESP1 */
 static uint32_t   s_err_line;    /* 原始诊断：出错所在的源文件行号 */
 
+/* ---- OLED 显存自检 ----
+   用来判断"花屏"到底是谁干的：
+     画完一页立刻算一次校验和当基准，静止 2.5 秒后再算一次；
+     两次不一致 = 有东西在往显存里写（真被踩了）；
+     一直一致但屏幕还是花 = 问题在 I2C / 屏那边，不是 RAM。 */
+static uint32_t   s_oled_sum;    /* 画完时的校验和（基准） */
+static uint32_t   s_oled_now;    /* 静止后再算一次的校验和 */
+static uint16_t   s_oled_bad;    /* 校验和不一致的次数（显存被改） */
+static uint16_t   s_oled_i2c_bad;/* OLED_Refresh() 传输失败的次数 */
+static uint8_t    s_oled_wait;   /* 1 = 有一页等着校验 */
+
 /* DWT 周期计数器（Cortex-M4 内核自带，不占外设） */
 #define T_DWT_DEMCR  (*(volatile uint32_t *)0xE000EDFCUL)
 #define T_DWT_CTRL   (*(volatile uint32_t *)0xE0001000UL)
@@ -203,6 +214,50 @@ static uint32_t t_dwt_us(uint32_t start)
 	return (T_DWT_CYCCNT - start) / (SystemCoreClock / 1000000U);
 }
 
+/** 初始化进度（g_tfStep）的可读名字。失败时看这个比看数字直观得多 */
+static const char *t_step_name(uint32_t s)
+{
+	switch (s)
+	{
+	case TF_STEP_NONE:     return "-";
+	case TF_STEP_GPIO:     return "gpio";
+	case TF_STEP_POWER:    return "power";
+	case TF_STEP_CLK_INIT: return "clk init";
+	case TF_STEP_CMD0:     return "cmd0";
+	case TF_STEP_CMD8:     return "cmd8";
+	case TF_STEP_ACMD41:   return "acmd41";
+	case TF_STEP_CMD2:     return "cmd2";
+	case TF_STEP_CMD3:     return "cmd3";
+	case TF_STEP_CMD9:     return "cmd9";
+	case TF_STEP_CMD7:     return "cmd7";
+	case TF_STEP_CMD16:    return "cmd16";
+	case TF_STEP_ACMD6:    return "acmd6";
+	case TF_STEP_CLK_RUN:  return "clk run";
+	case TF_STEP_READY:    return "ready";
+	case TF_STEP_READ:     return "read";
+	case TF_STEP_WRITE:    return "write";
+	case TF_STEP_SPEED:    return "speed";
+	default:               return "?";
+	}
+}
+
+/** 对 OLED 显存采样算校验和。
+ *  OLED_GetPoint() 读的是本地显存（不走 I2C），512 个采样点很快。 */
+static uint32_t t_oled_sum(void)
+{
+	uint32_t s = 0U;
+	uint8_t  x, y;
+
+	for (y = 0U; y < OLED_HEIGHT; y += 4U)
+	{
+		for (x = 0U; x < OLED_WIDTH; x += 4U)
+		{
+			s = s * 33U + OLED_GetPoint(x, y);
+		}
+	}
+	return s;
+}
+
 /** 认文件系统（看分区引导扇区里的标志串） */
 static const char *t_fs_name(const uint8_t *bs)
 {
@@ -213,7 +268,9 @@ static const char *t_fs_name(const uint8_t *bs)
 	return "unknown";
 }
 
-/** 画一页到 OLED */
+/** 画一页到 OLED。
+ *  ★ 所有页都用同一套版式（8x16 字体、4 行、行高 16），这样翻页时
+ *    新旧内容在同一位置互相替换，不会出现"整屏重排"那种花屏感。 */
 static void t_page(uint8_t p)
 {
 	OLED_Clear();
@@ -243,35 +300,52 @@ static void t_page(uint8_t p)
 			T8(2, 0, t_st_short(s_fail_st));
 			T8(2, 48, "step");
 			T8U(2, 88, s_err_step, 2U);
-			T8(3, 0, "sta");
-			T8X(3, 32, s_err_sta, 8U);
+			/* 卡在哪一步，直接用文字写出来 —— 这一行最有用 */
+			T8(3, 0, t_step_name(s_err_step));
 		}
 	}
 	else if (p == 1U)
 	{
-		/* ---------------- P1 五项检查的结果 ---------------- */
+		/* ---------------- P1 各项检查的结果 ---------------- */
 		T8(0, 0, "1 init"); T8(0, 64, s_init_txt);
 		T8(1, 0, "2 mbr "); T8(1, 64, s_mbr_txt);
 		T8(2, 0, "3 fs  "); T8(2, 64, s_fs_txt);
 		T8(3, 0, "4 rep "); T8(3, 64, s_rep_txt);
 	}
+	else if (p == 2U)
+	{
+		/* ---------------- P2 吞吐 / 卡信息 ---------------- */
+		T8(0, 0, "spd");   T8U(0, 32, s_kbps, 5U);  T8(0, 72, "KB/s");
+		T8(1, 0, "128KB"); T8U(1, 48, s_tp_us, 7U); T8(1, 104, "us");
+		T8(2, 0, "type");  T8(2, 40, s_type_txt);
+		T8(3, 0, "blk");   T8U(3, 32, s_blk_cnt, 10U);
+	}
+	else if (p == 3U)
+	{
+		/* ---------------- P3 总线 / 原始诊断 ---------------- */
+		T8(0, 0, "sta");  T8X(0, 32, s_err_sta, 8U);
+		T8(1, 0, "bus");  T8(1, 32, s_bus_txt);
+		T8(1, 72, s_dma_txt);
+		T8(1, 104, s_hs_txt);
+		T8(2, 0, "line"); T8U(2, 40, s_err_line, 4U);
+		T8(3, 0, "resp"); T8X(3, 40, s_err_resp, 8U);
+	}
 	else
 	{
-		/* ---------------- P2 吞吐 / 卡信息 / 原始诊断 ---------------- */
-		T6(0,   0, "5 spd"); T6U(0, 48, s_kbps, 5U); T6(0, 88, "KB/s");
-		T6(1,   0, "128KB"); T6U(1, 42, s_tp_us, 7U); T6(1, 88, "us");
-		T6(2,   0, "type");  T6(2, 42, s_type_txt);
-		T6(3,   0, "blk");   T6U(3, 42, s_blk_cnt, 10U);
-		T6(4,   0, "bus");   T6(4, 42, s_bus_txt);
-		T6(4,  78, s_dma_txt);
-		T6(4, 108, s_hs_txt);
-		T6(5,   0, "sta");   T6X(5, 42, s_err_sta, 8U);
-		T6(6,   0, "line");  T6U(6, 30, s_err_line, 4U);
-		T6(6,  66, "step");  T6U(6, 102, s_err_step, 2U);
-		T6(7,   0, "resp");  T6X(7, 30, s_err_resp, 8U);
+		/* ---------------- P4 OLED 自检 ----------------
+		   ram bad 一直是 0 -> 显存没被人写，屏幕还花就是 I2C / 屏那边的事；
+		   ram bad 往上涨   -> 有东西在往显存里写（真被踩了）；
+		   i2c bad 往上涨   -> OLED_Refresh() 的 I2C 传输在失败（线/上拉/干扰）。 */
+		T8(0, 0, "OLED RAM");
+		T8(1, 0, "ram bad"); T8U(1, 64, s_oled_bad, 4U);
+		T8(2, 0, "i2c bad"); T8U(2, 64, s_oled_i2c_bad, 4U);
+		T8(3, 0, "sum");     T8X(3, 32, s_oled_sum, 8U);
 	}
 
-	OLED_Refresh();
+	if (OLED_Refresh() != HAL_OK)
+	{
+		++s_oled_i2c_bad;
+	}
 }
 
 void test_tf_card(void)
@@ -302,6 +376,12 @@ void test_tf_card(void)
 	s_err_resp  = 0U;
 	s_err_line  = 0U;
 	partLba     = 0U;
+
+	s_oled_sum     = 0U;
+	s_oled_now     = 0U;
+	s_oled_bad     = 0U;
+	s_oled_i2c_bad = 0U;
+	s_oled_wait    = 0U;
 
 	/* ---- 开机提示：识别 + 测试要跑几百毫秒到几秒，先给个反馈 ---- */
 	OLED_Clear();
@@ -429,10 +509,26 @@ show:
 	while (1)
 	{
 		uint8_t p;
-		for (p = 0U; p < 3U; ++p)
+
+		for (p = 0U; p < 6U; ++p)
 		{
+			/* 上一页已经静止了 2.5 秒，先验一下显存有没有被谁踩过 */
+			if (s_oled_wait != 0U)
+			{
+				s_oled_now = t_oled_sum();
+				if (s_oled_now != s_oled_sum)
+				{
+					++s_oled_bad;
+				}
+				s_oled_wait = 0U;
+			}
+
 			t_page(p);
-			BSP_DelayMs(3000U);
+
+			s_oled_sum  = t_oled_sum();     /* 画完立刻存一份基准 */
+			s_oled_wait = 1U;
+
+			BSP_DelayMs(2500U);
 		}
 	}
 }

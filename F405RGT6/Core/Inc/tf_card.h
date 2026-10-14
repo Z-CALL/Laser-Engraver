@@ -144,8 +144,12 @@ extern "C" {
 #define TF_DATA_TIMEOUT_PER_BLOCK_MS   50U
 #define TF_DATA_TIMEOUT_MIN_MS         500U
 
-/* ACMD41 轮询上限。卡上电到 ready 通常几十次就够，给足余量 */
-#define TF_ACMD41_TRIES     0x000FFFFFU
+/* ACMD41 轮询上限。
+ * 卡上电到 ready 通常几十次就够。★ 每轮里有 HAL_Delay(1)，所以这个数
+ * 基本就是"最多等多少毫秒"：原来是 0xFFFFF(≈17 分钟！)，卡要是不 ready
+ * 会像死机一样卡在识别里（配合 TF_INIT_RETRY=3 更久）。
+ * SD 规范要求卡在上电 1 秒内初始化完成，给 4000(≈4 秒) 已经非常宽裕。 */
+#define TF_ACMD41_TRIES     4000U
 
 /* ==========================================================================
  * 返回值

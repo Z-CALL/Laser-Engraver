@@ -445,9 +445,21 @@ const char *TF_SpeedStr(uint8_t level)
  *  @param arg     参数
  *  @param resp    TF_RESP_NONE / _SHORT / _LONG
  *  @param to_ms   超时毫秒，0 = 不限时（靠循环兜底）
+ *  @param no_crc  1 = 不把响应 CRC 错当失败（R3 用，见下面的说明）
  *  @retval TF_OK 或错误码
- *  ★ 响应值放在 SDIO->RESP1..4，调用方自己读。 */
-static TF_Status tf_cmd(uint8_t idx, uint32_t arg, uint32_t resp, uint32_t to_ms)
+ *  ★ 响应值放在 SDIO->RESP1..4，调用方自己读。
+ *
+ *  ★★ 关于 CCRCFAIL（"1 init cCRC" 就是栽在这里）：
+ *     - R1/R6（短响应）里带 CRC7，校验不过确实是真错，照旧报 TF_ERR_CMD_CRC；
+ *     - R2（CMD2/CMD9 的长响应）和 R3（ACMD41 返回的 OCR）按规范
+ *       【没有可校验的 CRC7】：R3 的 48 位里根本没有 CRC 字段，
+ *       最后 8 位其实是 OCR 的低位；SDIO 外设照它的"CRC"去比，必然置
+ *       CCRCFAIL。ST 的 HAL 在 SDMMC_GetCmdResp2() / SDMMC_GetCmdResp3()
+ *       里也是直接清掉这个标志、不当错误处理。
+ *     所以这里对 R2 自动放宽，对 R3 用 no_crc 显式放宽；
+ *     放宽后响应内容照样读得到，由调用方自己判断内容对不对。 */
+static TF_Status tf_cmd_ex(uint8_t idx, uint32_t arg, uint32_t resp, uint32_t to_ms,
+                           uint8_t no_crc)
 {
     uint32_t sta;
     uint32_t cmdreg;
@@ -497,9 +509,16 @@ static TF_Status tf_cmd(uint8_t idx, uint32_t arg, uint32_t resp, uint32_t to_ms
     }
     if ((sta & SDIO_STA_CCRCFAIL) != 0U)
     {
-        TF_MARK(__LINE__);
-        g_tfLastSta = sta;
-        return TF_ERR_CMD_CRC;
+        /* ★ R2（长响应）和显式声明 no_crc 的命令（R3/ACMD41）按规范没有
+           可校验的 CRC7，这里的 CCRCFAIL 是假警报：清掉继续，
+           响应内容（RESP1..4）照样是有效的，由调用方判断内容对不对。 */
+        if ((no_crc == 0U) && (resp != TF_RESP_LONG))
+        {
+            TF_MARK(__LINE__);
+            g_tfLastSta = sta;
+            return TF_ERR_CMD_CRC;
+        }
+        SDIO->ICR = SDIO_STA_CCRCFAIL;
     }
     if ((sta & SDIO_STA_CMDREND) == 0U)
     {
@@ -509,6 +528,12 @@ static TF_Status tf_cmd(uint8_t idx, uint32_t arg, uint32_t resp, uint32_t to_ms
     }
 
     return TF_OK;
+}
+
+/** 普通命令（R1/R6/R7 这类带有效 CRC7 的）：不放宽 CRC 检查 */
+static TF_Status tf_cmd(uint8_t idx, uint32_t arg, uint32_t resp, uint32_t to_ms)
+{
+    return tf_cmd_ex(idx, arg, resp, to_ms, 0U);
 }
 
 /** 读回 4 个响应寄存器（长响应用） */
@@ -931,7 +956,12 @@ static TF_Status tf_acmd41(uint32_t *ocr_out)
             return st;
         }
 
-        st = tf_cmd(TF_ACMD_SD_OP_COND, TF_ACMD41_ARG, TF_RESP_SHORT, TF_CMD_TIMEOUT_MS);
+        /* ★ 注意用 tf_cmd_ex(..., 1U)：ACMD41 的 R3 响应里没有 CRC7，
+           SDIO 外设必然置 CCRCFAIL，必须放宽，否则识别永远卡死在这一步
+           （现象就是 TF_Init() 返回 TF_ERR_CMD_CRC，即 OLED 上的 "1 init cCRC"）。
+           响应内容就是 OCR，下面用它的 bit31/bit30 自己判断。 */
+        st = tf_cmd_ex(TF_ACMD_SD_OP_COND, TF_ACMD41_ARG, TF_RESP_SHORT,
+                       TF_CMD_TIMEOUT_MS, 1U);
         if (st != TF_OK)
         {
             return st;
@@ -1262,7 +1292,12 @@ TF_Status TF_Init(void)
         HAL_Delay(50U);
     }
 
-    /* 全失败了：把 SDIO 断掉，别在总线上挂着 */
+    /* 全失败了：把 SDIO 彻底关掉。
+       ★ 只清 POWER 是不够的 —— CLKCR 里的 CLKEN 还开着，SDIO_CK 会继续
+         在 PC12 上按 400kHz 一直跑，白白往外辐射（对旁边那条 OLED 的
+         I2C 就是干扰源）。所以时钟、数据通道、卡电一起断。 */
+    SDIO->DCTRL = 0U;
+    SDIO->CLKCR = 0U;
     SDIO->POWER = 0U;
     return st;
 }
