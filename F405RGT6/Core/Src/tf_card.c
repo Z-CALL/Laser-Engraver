@@ -693,6 +693,38 @@ static void tf_dma_stop(uint32_t mem_to_periph)
     }
 }
 
+/**
+ * 等一条 DMA 流真的把 NDTR 走完（返回 1 = 走完，0 = 超时）。
+ *
+ * ★★ 为什么必须等 —— 这是个非常阴的坑：
+ *    SDIO 的 DATAEND 是按"SDIDCOUNT 归零"置位的，而 DCOUNT 归零只说明
+ *    数据【进了 SDIO 自己的 FIFO】，不代表 DMA 已经把它写进内存。
+ *    此刻若立刻 tf_dma_stop()（往 CR 写 0），就会把还在跑的流【掐掉】，
+ *    块尾最后几个字永远留在 FIFO 里丢掉。
+ *
+ * ★★ 丢了尾巴【不会报任何错】，所以极难查：
+ *    - DMA 模式下 remaining 被无条件置 0，长度检查形同虚设；
+ *    - 数据 CRC 是硬件按"进了 FIFO 的字节"算的，照样通过；
+ *    - 反复读同一块，每次都丢同样多，一致性测试也发现不了。
+ *    表现就是"块尾是缓冲区里的旧数据"。
+ *    典型症状：MBR 的 55AA 签名没了（块 0 的 510/511 正好是最后 2 字节），
+ *    但同一块靠前的分区表项又是对的 —— 看着像"卡没有 MBR"。
+ */
+static uint8_t tf_dma_wait_done(uint32_t mem_to_periph, uint32_t to_ms)
+{
+    DMA_Stream_TypeDef *stream = mem_to_periph ? TF_DMA_TX_STREAM : TF_DMA_RX_STREAM;
+    const uint32_t      t0     = HAL_GetTick();
+
+    while (stream->NDTR != 0U)
+    {
+        if ((HAL_GetTick() - t0) > to_ms)
+        {
+            return 0U;
+        }
+    }
+    return 1U;
+}
+
 /** 开一次 DMA2 时钟 + 复位两条流（初始化时调一次） */
 static void tf_dma_init(void)
 {
@@ -1384,6 +1416,7 @@ TF_Status TF_ReadBlocks(uint32_t block, uint8_t *buf, uint32_t count)
     uint32_t  i;
     uint32_t  w;
     uint32_t  use_dma;
+    uint32_t  dma_bad;
     uint8_t  *p = buf;
 
     if ((buf == 0) || (count == 0U))
@@ -1418,6 +1451,7 @@ TF_Status TF_ReadBlocks(uint32_t block, uint8_t *buf, uint32_t count)
        ★ DMA 的 MSIZE 是 32 位，要求内存地址 4 字节对齐。
          这里不报错，而是静默退回 CPU 轮询路径 —— 调用方不用关心对齐。 */
     use_dma = ((TF_USE_DMA != 0) && (((uint32_t)buf & 3U) == 0U)) ? 1U : 0U;
+    dma_bad = 0U;
 
     /* ---- 配数据路径（读：read_from_card=1 -> DTDIR=1）---- */
     tf_data_config(total, 1U, use_dma);
@@ -1462,6 +1496,13 @@ TF_Status TF_ReadBlocks(uint32_t block, uint8_t *buf, uint32_t count)
         sta = tf_wait_sta(SDIO_STA_RXOVERR | SDIO_STA_DCRCFAIL |
                           SDIO_STA_DTIMEOUT | SDIO_STA_STBITERR |
                           SDIO_STA_DATAEND, to_ms);
+        /* ★★ DATAEND 只说明数据进了 SDIO 的 FIFO。必须再等 DMA 把 NDTR
+           走完才能停流，否则块尾几个字会被 tf_dma_stop() 掐掉丢掉
+           （丢尾巴不报错，见 tf_dma_wait_done 的说明）。 */
+        if (tf_dma_wait_done(0U, to_ms) == 0U)
+        {
+            dma_bad = 1U;
+        }
         tf_dma_stop(0U);
         remaining = 0U;             /* DMA 模式不看这个计数 */
     }
@@ -1554,9 +1595,13 @@ TF_Status TF_ReadBlocks(uint32_t block, uint8_t *buf, uint32_t count)
         tf_abort_transfer();
     }
 
-    if (remaining != 0U)
+    if ((remaining != 0U) || (dma_bad != 0U))
     {
-        /* 少收了字节：即便 DATAEND 置了也不能算成功 */
+        /* 少收了字节 / DMA 没搬完：即便 DATAEND 置了也不能算成功 */
+        if (dma_bad != 0U)
+        {
+            tf_abort_transfer();
+        }
         TF_MARK(__LINE__); g_tfLastSta = sta;
         return TF_ERR_DATA_TIMEOUT;
     }
@@ -1662,6 +1707,7 @@ TF_Status TF_WriteBlocks(uint32_t block, const uint8_t *buf, uint32_t count)
     uint32_t  i;
     uint32_t  w;
     uint32_t  use_dma;
+    uint32_t  dma_bad;
     const uint8_t *p = buf;
 
     if ((buf == 0) || (count == 0U))
@@ -1694,6 +1740,7 @@ TF_Status TF_WriteBlocks(uint32_t block, const uint8_t *buf, uint32_t count)
 
     /* ---- 选搬运方式（DMA 要 4 字节对齐）---- */
     use_dma = ((TF_USE_DMA != 0) && (((uint32_t)buf & 3U) == 0U)) ? 1U : 0U;
+    dma_bad = 0U;
 
     /* ---- 配数据路径（写：read_from_card=0 -> DTDIR=0，控制器→卡）---- */
     tf_data_config(total, 0U, use_dma);
@@ -1736,6 +1783,11 @@ TF_Status TF_WriteBlocks(uint32_t block, const uint8_t *buf, uint32_t count)
         sta = tf_wait_sta(SDIO_STA_TXUNDERR | SDIO_STA_DCRCFAIL |
                           SDIO_STA_DTIMEOUT | SDIO_STA_STBITERR |
                           SDIO_STA_DATAEND, to_ms);
+        /* 和读路径同理：确认 DMA 真的把 NDTR 走完再停流 */
+        if (tf_dma_wait_done(1U, to_ms) == 0U)
+        {
+            dma_bad = 1U;
+        }
         tf_dma_stop(1U);
         words_sent = words_total;       /* DMA 搬完就是全部搬完 */
     }
@@ -1804,7 +1856,7 @@ TF_Status TF_WriteBlocks(uint32_t block, const uint8_t *buf, uint32_t count)
     }
 
     /* 灌的字数必须正好对上，少一个字都说明数据不完整 */
-    if (words_sent != words_total)
+    if ((words_sent != words_total) || (dma_bad != 0U))
     {
         TF_MARK(__LINE__); g_tfLastSta = sta;
         return TF_ERR_DATA_TIMEOUT;

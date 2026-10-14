@@ -138,6 +138,8 @@ static uint32_t   s_err_step;    /* 原始诊断：卡在哪一步 */
 static uint32_t   s_err_sta;     /* 原始诊断：出错瞬间 SDIO->STA */
 static uint32_t   s_err_resp;    /* 原始诊断：出错那条命令的 RESP1 */
 static uint32_t   s_err_line;    /* 原始诊断：出错所在的源文件行号 */
+static uint32_t   s_part_lba;    /* 块 0 里解析出的第一个分区起始 LBA */
+static uint8_t    s_tail[16];    /* 块 0 的最后 16 字节（496..511）—— 看 55AA 在不在 */
 
 /* ---- OLED 显存自检 ----
    用来判断"花屏"到底是谁干的：
@@ -157,7 +159,8 @@ static uint8_t    s_oled_wait;   /* 1 = 有一页等着校验 */
 
 /* 画字的小宏，省得到处写坐标换算。
    T8 = 8x16 字体（一屏 4 行，16 字符/行）
-   T6 = 6x8  字体（一屏 8 行，21 字符/行） */#define T8(row, x, s)      OLED_ShowString((x), (uint8_t)((row) * 16U), (s), OLED_FONT_08, 1U)
+   T6 = 6x8  字体（一屏 8 行，21 字符/行） */
+#define T8(row, x, s)      OLED_ShowString((x), (uint8_t)((row) * 16U), (s), OLED_FONT_08, 1U)
 #define T8U(row, x, v, n)  OLED_ShowUNum((x), (uint8_t)((row) * 16U), (v), (n), OLED_FONT_08, 1U)
 #define T8X(row, x, v, n)  OLED_ShowHexNum((x), (uint8_t)((row) * 16U), (v), (n), OLED_FONT_08, 1U)
 #define T6(row, x, s)      OLED_ShowString((x), (uint8_t)((row) * 8U), (s), OLED_FONT_06, 1U)
@@ -320,9 +323,24 @@ static void t_u_hex(uint32_t v)
 	(void)HAL_UART_Transmit(&T_UART_HANDLE, (const uint8_t *)o, 8U, 100U);
 }
 
+/** 打一个字节的十六进制 + 空格（用来 dump 原始字节） */
+static void t_u_b(uint8_t v)
+{
+	static const char hx[16] = {'0','1','2','3','4','5','6','7',
+	                            '8','9','A','B','C','D','E','F'};
+	char o[3];
+
+	o[0] = hx[(v >> 4U) & 0x0FU];
+	o[1] = hx[v & 0x0FU];
+	o[2] = ' ';
+	(void)HAL_UART_Transmit(&T_UART_HANDLE, (const uint8_t *)o, 3U, 100U);
+}
+
 /** 把报告打成文本从串口发出去：屏幕上有的都有，外加几个屏幕上放不下的 */
 static void t_uart_report(void)
 {
+	uint8_t i;
+
 	t_u_str("\r\n=== TF CARD TEST ===\r\n");
 	t_u_str("result : "); t_u_str((s_fail == 0U) ? "PASS" : "FAIL"); t_u_str("\r\n");
 	if (s_fail != 0U)
@@ -353,6 +371,13 @@ static void t_uart_report(void)
 	                      t_u_hex(g_tf.csd[1]); t_u_str(" ");
 	                      t_u_hex(g_tf.csd[2]); t_u_str(" ");
 	                      t_u_hex(g_tf.csd[3]); t_u_str("\r\n");
+	/* 块 0 的分区起始 LBA + 最后 16 字节（496..511）。
+	   正常 MBR 的最后两字节必须是 55 AA。
+	   ★ 如果这里看到尾部是 00，而前面又是对的，那就是 DMA 把块尾丢了。 */
+	t_u_str("partlba: "); t_u_num(s_part_lba); t_u_str("\r\n");
+	t_u_str("blk0tail: ");
+	for (i = 0U; i < 16U; ++i) { t_u_b(s_tail[i]); }
+	t_u_str("\r\n");
 	t_u_str("oled   : ram bad "); t_u_num(s_oled_bad);
 	t_u_str(" i2c bad ");         t_u_num(s_oled_i2c_bad); t_u_str("\r\n");
 }
@@ -530,6 +555,14 @@ void test_tf_card(void)
 
 	/* 没有 55AA 签名不算失败（裸卡/空卡也这样），读取本身成功就算通 */
 	s_mbr_txt = ((t_blk[510] == 0x55U) && (t_blk[511] == 0xAAU)) ? "55AA" : "noMBR";
+
+	/* 留一份原始证据：分区起始 LBA + 块 0 的最后 16 字节。
+	   ★ 若这里是 00 而 partLba 又是合理的，说明块尾被丢了（DMA 竞态）。 */
+	s_part_lba = partLba;
+	for (i = 0U; i < 16U; ++i)
+	{
+		s_tail[i] = t_blk[496U + i];
+	}
 
 	/* ================= [3] 认文件系统 ================= */
 	if ((partLba == 0U) || (partLba >= g_tf.blockCount))
