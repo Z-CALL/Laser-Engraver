@@ -50,6 +50,18 @@ void MX_DMA_Init(void)
   HAL_NVIC_SetPriority(DMA1_Stream3_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream3_IRQn);
 
+  /* ★ SDIO(HAL_SD) 用的 DMA2 —— 从新建的 HAL 工程拷过来：
+       DMA2_Stream3 = 卡 → 内存，DMA2_Stream6 = 内存 → 卡。
+       原来这里只有 DMA1（USART3 蓝牙），接 HAL_SD 必须补上 DMA2。 */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA2_Stream3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream3_IRQn);
+
+  /* DMA2_Stream6_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream6_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream6_IRQn);
 
 }
 

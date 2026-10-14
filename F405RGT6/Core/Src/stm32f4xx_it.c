@@ -61,6 +61,10 @@ extern TIM_HandleTypeDef htim2;
 extern DMA_HandleTypeDef hdma_usart3_rx;
 extern UART_HandleTypeDef huart5;
 extern DMA_HandleTypeDef hdma_usart3_tx;
+/* ★ SDIO(HAL_SD) 的 DMA 句柄 —— 从新建的 HAL 工程拷过来。
+   CubeMX 的约定是在 it.c 里 extern（sdio.h 只声明 hsd）。 */
+extern DMA_HandleTypeDef hdma_sdio_rx;
+extern DMA_HandleTypeDef hdma_sdio_tx;
 
 /* USER CODE BEGIN EV */
 
@@ -363,6 +367,37 @@ void SDIO_IRQHandler(void)
   /* USER CODE BEGIN SDIO_IRQn 1 */
 
   /* USER CODE END SDIO_IRQn 1 */
+}
+
+/**
+  * @brief This function handles DMA2 stream3 global interrupt.
+  * @note  DMA2_Stream3 = SDIO 读（卡 → 内存）。
+  *        HAL_SD 走 DMA 时由它调 HAL_DMA_IRQHandler 收尾。
+  */
+void DMA2_Stream3_IRQHandler(void)
+{
+  /* USER CODE BEGIN DMA2_Stream3_IRQn 0 */
+
+  /* USER CODE END DMA2_Stream3_IRQn 0 */
+  HAL_DMA_IRQHandler(&hdma_sdio_rx);
+  /* USER CODE BEGIN DMA2_Stream3_IRQn 1 */
+
+  /* USER CODE END DMA2_Stream3_IRQn 1 */
+}
+
+/**
+  * @brief This function handles DMA2 stream6 global interrupt.
+  * @note  DMA2_Stream6 = SDIO 写（内存 → 卡）。
+  */
+void DMA2_Stream6_IRQHandler(void)
+{
+  /* USER CODE BEGIN DMA2_Stream6_IRQn 0 */
+
+  /* USER CODE END DMA2_Stream6_IRQn 0 */
+  HAL_DMA_IRQHandler(&hdma_sdio_tx);
+  /* USER CODE BEGIN DMA2_Stream6_IRQn 1 */
+
+  /* USER CODE END DMA2_Stream6_IRQn 1 */
 }
 
 /* USER CODE BEGIN 1 */
