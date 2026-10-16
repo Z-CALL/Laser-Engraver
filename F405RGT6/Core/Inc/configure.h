@@ -35,6 +35,8 @@ extern uint16_t RASTER_TIM2_PERIOD;
 //激光使用的定时方式，1代表使用链表定时（可实现多任务定时），0代表使用延时定时（只支持单任务）
 #define TIME_DELAY 0
 
+//选择使用蓝牙还是从TF卡中获取数据
+#define BT_or_TFCard 1
 
 
 

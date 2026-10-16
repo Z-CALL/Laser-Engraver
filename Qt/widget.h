@@ -36,6 +36,22 @@ public:
     explicit Widget(QWidget *parent = 0);
     ~Widget();
 
+    /* ★ 界面设计尺寸（竖屏 600x1024）。
+       屏幕适配（逆时针转 90° / 等比缩小到屏幕）统一交给 main.cpp 的显示层做，
+       构造函数里**不要**再按 availableGeometry 改尺寸 —— 否则旋转前尺寸就被改掉了，
+       转 90° 之后凑不出开发板要的 1024x600。 */
+    static int designWidth()  { return 600; }
+    static int designHeight() { return 1024; }
+
+    /* ★ 内嵌提示层。
+       旋转显示时整个界面被放进 QGraphicsScene，而 QMessageBox::warning/::question
+       弹出来的是**独立顶层窗口**，不在场景里、不会跟着转（竖屏板上会看到歪 90° 的
+       对话框）。所以这两个提示统一改成"界面的一部分"。
+       原来的 QMessageBox::warning(this, ...) 换成 noticeInfo(...)，
+       QMessageBox::question(this, ...) == Yes 换成 noticeConfirm(...)。 */
+    void noticeInfo(const QString &title, const QString &text);
+    bool noticeConfirm(const QString &title, const QString &text);
+
     /* SerialIo 日志回调的落点（供 C 风格回调函数调用） */
     void appendSerialLog(const QString &line);
 
@@ -43,6 +59,10 @@ private slots:
     void onOpenImage();       /* 载入图片 */
     void refreshGray();       /* 按当前参数重算灰度与预览 */
     void onSaveGrayArray();   /* 导出灰度 C 二维数组 */
+
+    /* ★ 新增：导出「TF 卡图像」二进制文件（16 字节头 + 原始灰度字节）。
+       拷到 TF 卡根目录（建议命名 IMG.BIN），固件那边用 tf_image.c 读。 */
+    void onSaveCardImage();
 
     /* 串口面板 */
     void onSerialRefresh();   /* 重新枚举端口 */
@@ -84,6 +104,12 @@ private:
     void loadImage(const QString &path);
     QStringList buildGrayArrayLines() const;
 
+    /* ★ 新增：拼出「TF 卡图像」的二进制内容（格式见 tf_image.h 的说明）：
+       'GRY1' + u16 宽 + u16 高 + u32 数据字节数 + u32 CRC32 + 原始灰度字节。
+       ★ 数据部分和 buildGrayArrayLines() 用的是**同一套规则**
+         （弓字形倒序 + 灰度映射），所以两种导出出来的数据完全一致。 */
+    QByteArray buildCardImageBinary() const;
+
     /* 内嵌文件浏览面板（不弹独立窗口） */
     void enterFileBrowser(bool saveMode, const QStringList &filters,
                           const QString &suggested = QString());
@@ -121,6 +147,7 @@ private:
 
     QPushButton    *m_openBtn;
     QPushButton    *m_grayBtn;
+    QPushButton    *m_cardBtn;         /* ★ 新增：导出 TF 卡图像 */
     QPlainTextEdit *m_log;
 
     /* ---- 串口下发 ---- */
@@ -179,8 +206,12 @@ private:
 
     /* 文件浏览面板 */
     bool           m_fbSaveMode;
+    /* ★ 新增：本次保存是"二进制"（TF 卡图像）还是"文本行"（灰度 C 数组）。
+       两者共用同一个文件浏览面板，靠这个开关分流。 */
+    bool           m_fbSaveBinary;
     QString        m_fbDir;
     QStringList    m_pendingGrayLines;
+    QByteArray     m_pendingBinary;    /* ★ 新增：待保存的 TF 卡图像二进制内容 */
     QStackedWidget *m_stack;
     QWidget        *m_mainPage;
     QLabel         *m_fbPathLabel;

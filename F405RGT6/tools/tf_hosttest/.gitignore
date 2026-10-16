@@ -1,0 +1,5 @@
+# run.sh 现场生成的，不要提交（disk32.img 有 34MB）
+disk.img
+disk32.img
+*.exe
+shadow/

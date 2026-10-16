@@ -618,6 +618,26 @@
               <FileType>5</FileType>
               <FilePath>..\Core\Inc\tf_card.h</FilePath>
             </File>
+            <File>
+              <FileName>tf_fat.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\tf_fat.c</FilePath>
+            </File>
+            <File>
+              <FileName>tf_fat.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\Inc\tf_fat.h</FilePath>
+            </File>
+            <File>
+              <FileName>tf_image.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\tf_image.c</FilePath>
+            </File>
+            <File>
+              <FileName>tf_image.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\Inc\tf_image.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

@@ -25,6 +25,10 @@
 #include <QDateTime>
 #include <QSize>
 #include <QPixmap>
+#include <QEventLoop>
+#include <QFrame>
+#include <QPalette>
+#include <QColor>
 
 /* 背景截断阈值的默认值（界面上可调，这个只是初值）。
    见 buildUi() 里 m_grayCutSpin 的注释：小尺寸图建议调小甚至调 0。 */
@@ -111,23 +115,127 @@ Widget::Widget(QWidget *parent) :
     logMsg(QStringLiteral("构建版本 %1（监看已含弓字形奇数行校正）")
            .arg(QString::fromLatin1(kBuildTag)), true);
 
-    int w = 600;
-    int h = 1024;
-    const QRect avail = QGuiApplication::primaryScreen()->availableGeometry();
-    if ((w > avail.width()) || (h > avail.height()))
-    {
-        const double s = qMin((double)avail.width()  / (double)w,
-                              (double)avail.height() / (double)h);
-        w = qRound(w * s);
-        h = qRound(h * s);
-    }
-    setFixedSize(w, h);
-    move((avail.width() - w) / 2, qMax(0, (avail.height() - h) / 2));
+    /* ★ 固定按设计尺寸（竖屏 600x1024）。
+       适配开发板 1024x600 屏的「逆时针转 90°」以及「装不下就等比缩小」，
+       全部挪到 main.cpp 的显示层去做 —— 这里必须保持设计尺寸，
+       否则转 90° 之后就不是开发板要的 1024x600 了。 */
+    setFixedSize(designWidth(), designHeight());
 }
 
 Widget::~Widget()
 {
     delete ui;
+}
+
+/* ============================================================================
+ * ★ 内嵌提示层（替代 QMessageBox 的独立弹窗）
+ *
+ * 为什么要自己做一个：
+ *   适配开发板时，整个界面被放进 QGraphicsScene 里逆时针转了 90°。
+ *   而 QMessageBox::warning() / ::question() 弹出来的是**独立顶层窗口** ——
+ *   它不在这块场景里，也就不会跟着一起转，竖屏板上会看到一个歪 90° 的对话框，
+ *   还得歪着头看。
+ *
+ * 做法：
+ *   把「遮罩 + 面板」做成 Widget 的**子控件**。子控件天然是界面的一部分，
+ *   界面怎么转它们就怎么转。遮罩铺满整个界面挡住底下的按钮，
+ *   配合下面的局部事件循环，效果和模态对话框一样。
+ *
+ * ★ 这里刻意**不用 QMessageBox**：
+ *   实测（Qt 5.8 / MinGW，见验证记录）把 QMessageBox 用 setWindowFlags(Qt::Widget)
+ *   变成子控件会**直接段错误** —— QDialog 按窗口做的那套（done()/modality/
+ *   平台窗口）在"当子控件用"时并不成立。所以这里用 QFrame + QLabel +
+ *   QPushButton 自己搭，行为完全可预期。
+ * ==========================================================================*/
+static int showEmbeddedBox(QWidget *host, bool question,
+                           const QString &title, const QString &text)
+{
+    /* 遮罩：半透明盖住整个界面，既当模态用，也是面板的父控件 */
+    QWidget *shade = new QWidget(host);
+    shade->setGeometry(host->rect());
+    shade->setAutoFillBackground(true);
+    {
+        QPalette pal = shade->palette();
+        pal.setColor(QPalette::Window, QColor(0, 0, 0, 120));
+        shade->setPalette(pal);
+    }
+    shade->show();
+    shade->raise();
+
+    /* 白色面板 */
+    QFrame *panel = new QFrame(shade);
+    panel->setFrameShape(QFrame::Box);
+    panel->setAutoFillBackground(true);
+    {
+        QPalette pal = panel->palette();
+        pal.setColor(QPalette::Window, QColor(255, 255, 255));
+        panel->setPalette(pal);
+    }
+
+    QVBoxLayout *col = new QVBoxLayout(panel);
+    col->setContentsMargins(14, 12, 14, 12);
+    col->setSpacing(10);
+
+    QLabel *titleLabel = new QLabel(title, panel);
+    titleLabel->setStyleSheet(QStringLiteral("color:#000; font-weight:bold;"));
+    col->addWidget(titleLabel);
+
+    QLabel *textLabel = new QLabel(text, panel);
+    textLabel->setStyleSheet(QStringLiteral("color:#000;"));
+    textLabel->setWordWrap(true);
+    /* 定宽才能让 wordWrap 生效；宽度受宿主限制，窄屏也不会溢出 */
+    textLabel->setFixedWidth(qMin(qMax(240, host->width() - 100), 460));
+    col->addWidget(textLabel);
+
+    QEventLoop loop;
+    int result = QMessageBox::Ok;
+
+    QHBoxLayout *row = new QHBoxLayout();
+    row->addStretch(1);
+    if (question)
+    {
+        QPushButton *noBtn  = new QPushButton(QStringLiteral("否"), panel);
+        QPushButton *yesBtn = new QPushButton(QStringLiteral("是"), panel);
+        noBtn->setMinimumWidth(88);
+        yesBtn->setMinimumWidth(88);
+        yesBtn->setDefault(true);
+        QObject::connect(noBtn,  &QPushButton::clicked, [&result]() { result = QMessageBox::No;  });
+        QObject::connect(yesBtn, &QPushButton::clicked, [&result]() { result = QMessageBox::Yes; });
+        QObject::connect(noBtn,  SIGNAL(clicked()), &loop, SLOT(quit()));
+        QObject::connect(yesBtn, SIGNAL(clicked()), &loop, SLOT(quit()));
+        row->addWidget(noBtn);
+        row->addWidget(yesBtn);
+    }
+    else
+    {
+        QPushButton *okBtn = new QPushButton(QStringLiteral("确定"), panel);
+        okBtn->setMinimumWidth(88);
+        okBtn->setDefault(true);
+        QObject::connect(okBtn, SIGNAL(clicked()), &loop, SLOT(quit()));
+        row->addWidget(okBtn);
+    }
+    col->addLayout(row);
+
+    panel->adjustSize();
+    panel->move(qMax(0, (shade->width()  - panel->width())  / 2),
+                qMax(0, (shade->height() - panel->height()) / 2));
+    panel->show();
+    panel->raise();
+
+    loop.exec();
+
+    delete shade;   /* panel 是 shade 的子控件，一起删掉 */
+    return result;
+}
+
+void Widget::noticeInfo(const QString &title, const QString &text)
+{
+    showEmbeddedBox(this, false, title, text);
+}
+
+bool Widget::noticeConfirm(const QString &title, const QString &text)
+{
+    return showEmbeddedBox(this, true, title, text) == QMessageBox::Yes;
 }
 
 void Widget::buildUi()
@@ -268,6 +376,21 @@ void Widget::buildUi()
     m_grayBtn->setMinimumHeight(34);
     m_grayBtn->setStyleSheet("font-weight: bold;");
     main->addWidget(m_grayBtn);
+
+    /* ★ 新增：导出「TF 卡图像」二进制文件。
+       和上面那个用的是同一份灰度数据，只是存成固件能直接从卡上读的二进制
+       （16 字节头 + 原始灰度字节），拷到 TF 卡根目录就能用。 */
+    m_cardBtn = new QPushButton(QStringLiteral("导出TF卡图像(.bin)"), m_mainPage);
+    m_cardBtn->setMinimumHeight(34);
+    m_cardBtn->setStyleSheet("font-weight: bold;");
+    m_cardBtn->setToolTip(QStringLiteral(
+        "导出固件可直接从 TF 卡读取的二进制图像文件。\n"
+        "格式：'GRY1' + 宽(2) + 高(2) + 数据字节数(4) + CRC32(4) + 原始灰度字节\n"
+        "★ 卡上是 FAT 文件系统，固件只认 8.3 短名 —— 建议就存成 IMG.BIN，\n"
+        "  拷到卡根目录。\n"
+        "★ 数据内容和「导出灰度C数组」完全一致（弓字形/灰度映射都会算进去），\n"
+        "  所以两边雕出来的效果一样。"));
+    main->addWidget(m_cardBtn);
 
     /* ---------------- 串口下发 ---------------- */
     QLabel *serTitle = new QLabel(QStringLiteral("串口下发"), m_mainPage);
@@ -504,6 +627,7 @@ void Widget::buildUi()
     connect(m_widthSpin,  SIGNAL(valueChanged(int)), this, SLOT(refreshGray()));
     connect(m_heightSpin, SIGNAL(valueChanged(int)), this, SLOT(refreshGray()));
     connect(m_grayBtn,    SIGNAL(clicked()), this, SLOT(onSaveGrayArray()));
+    connect(m_cardBtn,    SIGNAL(clicked()), this, SLOT(onSaveCardImage()));
 
     connect(m_serRefreshBtn,    SIGNAL(clicked()), this, SLOT(onSerialRefresh()));
     connect(m_serOpenBtn,       SIGNAL(clicked()), this, SLOT(onSerialOpenClose()));
@@ -533,7 +657,9 @@ void Widget::buildUi()
     connect(m_fbCancelBtn,   SIGNAL(clicked()), this, SLOT(onFbCancel()));
 
     m_fbSaveMode = false;
+    m_fbSaveBinary = false;
     m_pendingGrayLines.clear();
+    m_pendingBinary.clear();
 }
 
 /* ====================== 雕刻回传监看 ====================== */
@@ -1102,16 +1228,15 @@ void Widget::onSerialSendConfig()
 {
     if (!m_ser->isOpen())
     {
-        QMessageBox::warning(this, QStringLiteral("提示"),
-                             QStringLiteral("请先打开串口"));
+        noticeInfo(QStringLiteral("提示"), QStringLiteral("请先打开串口"));
         return;
     }
     if (m_ser->isStreaming())
     {
-        QMessageBox::warning(this, QStringLiteral("提示"),
-                             QStringLiteral("正在下发图像，请先等它发完或点「中止」，"
-                                            "再下发配置。\n\n"
-                                            "配置包插进像素流中间会让固件的状态机错乱。"));
+        noticeInfo(QStringLiteral("提示"),
+                   QStringLiteral("正在下发图像，请先等它发完或点「中止」，"
+                                  "再下发配置。\n\n"
+                                  "配置包插进像素流中间会让固件的状态机错乱。"));
         return;
     }
 
@@ -1136,14 +1261,12 @@ void Widget::onSerialSend()
 {
     if (m_gray.isNull())
     {
-        QMessageBox::warning(this, QStringLiteral("提示"),
-                             QStringLiteral("请先打开一张图片"));
+        noticeInfo(QStringLiteral("提示"), QStringLiteral("请先打开一张图片"));
         return;
     }
     if (!m_ser->isOpen())
     {
-        QMessageBox::warning(this, QStringLiteral("提示"),
-                             QStringLiteral("请先打开串口"));
+        noticeInfo(QStringLiteral("提示"), QStringLiteral("请先打开串口"));
         return;
     }
     if (m_ser->isStreaming())
@@ -1153,10 +1276,9 @@ void Widget::onSerialSend()
     }
     if (m_ser->pendingBytes() > 0)
     {
-        if (QMessageBox::question(this, QStringLiteral("确认"),
+        if (!noticeConfirm(QStringLiteral("确认"),
                 QStringLiteral("队列里还有 %1 字节未发完，确定重新开始下发整幅图吗？\n"
-                               "（会先清空队列）").arg(m_ser->pendingBytes()),
-                QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+                               "（会先清空队列）").arg(m_ser->pendingBytes())))
             return;
         m_ser->abortStream();
     }
@@ -1566,8 +1688,7 @@ void Widget::onSaveGrayArray()
 {
     if (m_gray.isNull())
     {
-        QMessageBox::warning(this, QStringLiteral("提示"),
-                             QStringLiteral("请先打开一张图片"));
+        noticeInfo(QStringLiteral("提示"), QStringLiteral("请先打开一张图片"));
         return;
     }
 
@@ -1584,9 +1705,7 @@ void Widget::onSaveGrayArray()
             "导出成 C 二维数组大约要 %4 MB 文本（每个值约 5.4 字节）。\n\n"
             "确定继续吗？")
                 .arg(w).arg(h).arg(total).arg(estMb);
-        if (QMessageBox::question(this, QStringLiteral("导出确认"), msg,
-                                  QMessageBox::Yes | QMessageBox::No,
-                                  QMessageBox::No) != QMessageBox::Yes)
+        if (!noticeConfirm(QStringLiteral("导出确认"), msg))
             return;
     }
 
@@ -1600,11 +1719,136 @@ void Widget::onSaveGrayArray()
            .arg(m_grayCutSpin ? m_grayCutSpin->value() : kGrayCutoffDefault), true);
 
     m_pendingGrayLines = buildGrayArrayLines();
+    m_fbSaveBinary     = false;        /* ★ 走文本那条路 */
 
     enterFileBrowser(true,
         QStringList() << QStringLiteral("C 源文件 (*.h *.c *.txt)")
                       << QStringLiteral("所有文件 (*)"),
         QStringLiteral("gray_image.h"));
+}
+
+/* ================= TF 卡图像导出（二进制） ================= */
+
+/** 小端写 16 位 */
+static void cardPut16(QByteArray &b, quint16 v)
+{
+    b.append(char( v       & 0xFF));
+    b.append(char((v >> 8) & 0xFF));
+}
+
+/** 小端写 32 位 */
+static void cardPut32(QByteArray &b, quint32 v)
+{
+    b.append(char( v         & 0xFF));
+    b.append(char((v >>  8)  & 0xFF));
+    b.append(char((v >> 16)  & 0xFF));
+    b.append(char((v >> 24)  & 0xFF));
+}
+
+/**
+ * 标准 CRC-32/ISO-HDLC（多项式 0xEDB88320，初值 0xFFFFFFFF，末尾取反）。
+ * ★ 固件侧 tf_image.c 里的 tfimg_crc32_update() 是同一个算法 ——
+ *   要改必须两边一起改，否则固件自检会一直报 CRC 不一致。
+ * ★ Qt 没有现成的 CRC32（qChecksum 是 CRC-16），所以这里手写。
+ */
+static quint32 cardCrc32(const uchar *p, quint32 n)
+{
+    quint32 crc = 0xFFFFFFFFu;
+
+    while (n-- > 0)
+    {
+        crc ^= (quint32)(*p++);
+        for (int i = 0; i < 8; ++i)
+        {
+            crc = ((crc & 1u) != 0u) ? ((crc >> 1) ^ 0xEDB88320u) : (crc >> 1);
+        }
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+/**
+ * 拼出「TF 卡图像」的完整二进制内容。
+ *
+ * 布局（对应固件 Core/Inc/tf_image.h 里的说明）：
+ *     0     4   'GRY1'
+ *     4     2   宽 (u16 小端)
+ *     6     2   高 (u16 小端)
+ *     8     4   数据字节数 = 宽*高 (u32 小端)
+ *     12    4   数据的 CRC32 (u32 小端)
+ *     16    N   原始灰度字节，逐行；y=0 在最上；行内是"扫描顺序"
+ *
+ * ★ 数据部分和 buildGrayArrayLines() 用的是同一套规则（弓字形倒序 + 灰度映射），
+ *   所以"导出的 C 数组"和"导出的 .bin"内容完全一致，雕出来效果一样。
+ */
+QByteArray Widget::buildCardImageBinary() const
+{
+    const int  w      = m_gray.width();
+    const int  h      = m_gray.height();
+    const bool bidi   = m_bidiBox->isChecked();
+    const int  lo     = m_grayLoSpin->value();
+    const int  hi     = m_grayHiSpin->value();
+    const bool mapped = (lo != 0) || (hi != 255);
+
+    QByteArray payload;
+    payload.reserve(w * h);
+
+    for (int y = 0; y < h; ++y)
+    {
+        const uchar *row = m_gray.constScanLine(y);
+        const bool   rev = bidi && ((y & 1) != 0);
+
+        for (int x = 0; x < w; ++x)
+        {
+            const int sx = rev ? (w - 1 - x) : x;   /* 按扫描顺序取源列 */
+            int v = (int)row[sx];
+            /* v==0 是「完全不出光」，不参与映射 —— 和文本导出保持一致 */
+            if (mapped && (v != 0))
+            {
+                v = lo + (v * (hi - lo) + 127) / 255;
+                if (v < 0)   { v = 0; }
+                if (v > 255) { v = 255; }
+            }
+            payload.append(char(v));
+        }
+    }
+
+    const quint32 crc = cardCrc32(reinterpret_cast<const uchar *>(payload.constData()),
+                                  (quint32)payload.size());
+
+    QByteArray out;
+    out.reserve(16 + payload.size());
+    out.append("GRY1", 4);
+    cardPut16(out, (quint16)w);
+    cardPut16(out, (quint16)h);
+    cardPut32(out, (quint32)payload.size());
+    cardPut32(out, crc);
+    out.append(payload);
+
+    return out;
+}
+
+void Widget::onSaveCardImage()
+{
+    if (m_gray.isNull())
+    {
+        noticeInfo(QStringLiteral("提示"), QStringLiteral("请先打开一张图片"));
+        return;
+    }
+
+    const int w = m_gray.width();
+    const int h = m_gray.height();
+
+    logMsg(QStringLiteral("导出 TF 卡图像: %1 x %2 = %3 字节数据 + 16 字节头；"
+                          "建议存成 IMG.BIN 并拷到 TF 卡根目录")
+               .arg(w).arg(h).arg((qint64)w * h), true);
+
+    m_pendingBinary = buildCardImageBinary();
+    m_fbSaveBinary  = true;
+
+    enterFileBrowser(true,
+        QStringList() << QStringLiteral("TF 卡图像 (*.bin *.BIN)")
+                      << QStringLiteral("所有文件 (*)"),
+        QStringLiteral("IMG.BIN"));
 }
 
 /* ================= 内嵌文件浏览面板 ================= */
@@ -1715,6 +1959,32 @@ void Widget::onFbOpen()
         return;
     }
 
+    /* ★ 二进制导出（TF 卡图像）：和文本导出共用这个文件浏览面板，
+       只是内容换成"16 字节头 + 原始灰度字节"，必须用 WriteOnly 原样写，
+       不能走下面的文本拼行（会加 CRLF、会破坏二进制）。 */
+    if (m_fbSaveBinary)
+    {
+        QFile fb(full);
+        if (!fb.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        {
+            setStatus(QStringLiteral("写入失败：%1").arg(full), false);
+        }
+        else
+        {
+            fb.write(m_pendingBinary);
+            fb.close();
+            setStatus(QStringLiteral("TF 卡图像已保存：%1 x %2 -> %3")
+                      .arg(m_gray.height()).arg(m_gray.width()).arg(full), true);
+            logMsg(QStringLiteral("已导出 TF 卡图像 %1 字节 -> %2（拷到 TF 卡根目录，"
+                                  "固件按 8.3 短名找，建议 IMG.BIN）")
+                       .arg(m_pendingBinary.size()).arg(full), true);
+        }
+
+        m_fbSaveBinary = false;
+        m_pendingBinary.clear();
+        return;
+    }
+
     /* 灰度数组写盘：UTF-8 字节直写 + 统一 CRLF + **不带 BOM**。
        ⚠ 不走 QTextStream —— 它写 UTF-8 会带 BOM，armcc/Keil 对 BOM 敏感。 */
     QFile f(full);
@@ -1745,4 +2015,6 @@ void Widget::onFbCancel()
 {
     m_stack->setCurrentIndex(0);
     m_pendingGrayLines.clear();
+    m_fbSaveBinary = false;            /* ★ 取消时也要清掉二进制待存内容 */
+    m_pendingBinary.clear();
 }

@@ -1,5 +1,7 @@
 #include "test.h"
 #include "tf_card.h"   /* TF_Init / TF_ReadBlocks / g_tf ... */
+#include "tf_fat.h"    /* 极简 FAT 只读查找器（tf_fat.c） */
+#include "tf_image.h"  /* 从卡上读图像文件 + 环形缓冲（tf_image.c） */
 #include "usart.h"     /* huart3（蓝牙口，测试时闲着，拿来做串口镜像） */
 #include <string.h>    /* memcmp / memcpy */
 
@@ -680,6 +682,124 @@ show:
 
 		/* 每转完一圈再发一份，什么时候接上串口都能抓到 */
 		t_uart_report();
+	}
+}
+
+/* ==========================================================================
+ * TF 卡图像读取测试（tf_fat.c / tf_image.c）
+ *
+ * 目的：**不动 main.c 就能确认"卡上那个文件能被完整读出来、一个字节不差"**。
+ *       这条通过之后再往雕刻循环里接，问题范围就小得多。
+ *
+ * 用法：
+ *   1. 上位机点「导出TF卡图像(.bin)」存成 IMG.BIN
+ *   2. 拷到 TF 卡根目录（卡是 FAT 文件系统，固件只认 8.3 短名，必须大写）
+ *   3. main.c 里把 test_tf_card() 换成 test_tf_image()
+ *
+ * ★ 它做的是：挂 FAT -> 找 IMG.BIN -> 读 16 字节头 -> 把整个文件读进环形缓冲
+ *   再全部取出来 -> 边取边算 CRC32 -> 和文件头里记的比。
+ *   CRC 一致 = 卡上那份数据和上位机导出的完全一样。
+ *
+ * ⚠ 自检会把整份数据"取走"（消费掉）。想接着雕刻就重新 TFIMG_Open()。
+ * ========================================================================== */
+void test_tf_image(void)
+{
+	TFIMG_TestResult r;
+	TF_Status        st;
+
+	OLED_Clear();
+	T8(0, 0, "TF IMG TEST");
+	T8(1, 0, "reading card...");
+	(void)OLED_Refresh();
+
+	st = TFIMG_SelfTest(&r);
+
+#if TF_TEST_UART
+	/* 串口镜像一份（USART3 = 蓝牙口，测试时闲着），方便直接复制粘贴 */
+	t_u_str("\r\n=== TF IMAGE TEST ===\r\n");
+	t_u_str("result : "); t_u_str((st == TF_OK) ? "PASS" : "FAIL"); t_u_str("\r\n");
+	t_u_str("file   : "); t_u_str(TFIMG_FILE_NAME); t_u_str("\r\n");
+	t_u_str("mount  : FAT"); t_u_num(g_tfFat.fatType);
+	t_u_str("  spc ");        t_u_num(g_tfFat.sectorsPerCluster);
+	t_u_str("  dataLba ");    t_u_num(g_tfFat.dataStartLba);
+	t_u_str("  clusters ");   t_u_num(g_tfFat.clusterCount); t_u_str("\r\n");
+	t_u_str("size   : "); t_u_num(r.width); t_u_str(" x "); t_u_num(r.height);
+	t_u_str(" = "); t_u_num(r.expectBytes); t_u_str(" bytes\r\n");
+	t_u_str("loaded : "); t_u_num(r.loadedBytes); t_u_str("\r\n");
+	t_u_str("taken  : "); t_u_num(r.consumedBytes); t_u_str("\r\n");
+	t_u_str("crc    : file "); t_u_hex(r.fileCrc32);
+	t_u_str("  calc ");        t_u_hex(r.calcCrc32);
+	t_u_str("  match ");       t_u_num(r.crcOk); t_u_str("\r\n");
+	t_u_str("err    : "); t_u_str(TFIMG_ErrStr()); t_u_str("\r\n");
+	t_u_str("ring   : "); t_u_num(TFIMG_RingSize()); t_u_str(" bytes\r\n");
+
+	/* ---- ★ 把"固件在卡上看得见什么"打出来 ----
+	   文件找不到时，这一段的判据比什么都直接：
+	     · mount 失败 + 原因  -> 卡不是 FAT16/32（exFAT/NTFS/FAT12），去重新格式化
+	     · root 里没有 IMG.BIN -> 名字不对（比如用了长文件名），或者放到子目录里了
+	     · root 里有 IMG.BIN 但读失败 -> 卡本身读不稳（看 TF_Init 那套） */
+	{
+		TF_FAT_File list[8];
+		uint32_t    n, k;
+		TF_Status   mst = TF_FAT_Mount();
+
+		t_u_str("\r\n--- TF card root dir ---\r\n");
+		t_u_str("mount  : "); t_u_str(TF_FAT_ErrStr(mst));
+		t_u_str("   ");       t_u_str(TF_FAT_Reason()); t_u_str("\r\n");
+
+		if (mst == TF_OK)
+		{
+			t_u_str("layout : partLba "); t_u_num(g_tfFat.partStartLba);
+			t_u_str("  FAT");             t_u_num(g_tfFat.fatType);
+			t_u_str("  spc ");            t_u_num(g_tfFat.sectorsPerCluster);
+			t_u_str("  dataLba ");        t_u_num(g_tfFat.dataStartLba);
+			t_u_str("  clusters ");       t_u_num(g_tfFat.clusterCount);
+			t_u_str("\r\n");
+
+			n = TF_FAT_ListRoot(list, 8U);
+			t_u_str("root   : "); t_u_num(n);
+			t_u_str(" entry(ies), files+dirs only\r\n");
+			for (k = 0U; k < n; ++k)
+			{
+				t_u_str("   ");
+				t_u_str(list[k].name);
+				if (TF_FAT_IS_DIR(list[k].attr) != 0U)
+				{
+					t_u_str("/   <-- sub-directory, firmware does NOT enter subdirs");
+				}
+				else
+				{
+					t_u_str("   size "); t_u_num(list[k].size);
+					t_u_str("   clu ");  t_u_num(list[k].firstCluster);
+				}
+				t_u_str("\r\n");
+			}
+			if (n == 0U)
+			{
+				t_u_str("   (root dir is empty - file in a subfolder?)\r\n");
+			}
+			t_u_str("want   : "); t_u_str(TFIMG_FILE_NAME);
+			t_u_str("  (8.3 short name, UPPERCASE, in ROOT)\r\n");
+		}
+	}
+#endif
+
+	/* ---- OLED 结论页（8x16 字体，一屏 4 行 16 字符）---- */
+	OLED_Clear();
+	T8(0, 0, (st == TF_OK) ? "RESULT: PASS" : "RESULT: FAIL");
+	T8(1, 0, "size ");
+	T8U(1, 40, r.width, 5U);
+	T8(1, 80, "x");
+	T8U(1, 88, r.height, 5U);
+	T8(2, 0, "bytes ");
+	T8U(2, 48, r.consumedBytes, 6U);
+	T8(3, 0, "crc ");
+	T8(3, 40, (r.crcOk != 0U) ? "OK" : "BAD");
+	(void)OLED_Refresh();
+
+	while (1)
+	{
+		BSP_DelayMs(500U);
 	}
 }
 

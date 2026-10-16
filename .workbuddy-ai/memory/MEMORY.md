@@ -1,5 +1,25 @@
 # Laser-Engraver 项目长期笔记
 
+## ★ 屏幕旋转（2026-10-16 新增，Qt 侧）
+
+界面是 **600x1024 竖屏**设计，开发板 LCD 是 **1024x600 横屏**，
+靠 `Qt/main.cpp` 的显示层**逆时针转 90°** 铺满屏幕
+（`QGraphicsScene` + `QGraphicsProxyWidget`，坐标反向映射由 QGraphicsView 自动做）。
+
+- 开关：`--rotate=N` / `JIGUANG_ROTATE` / `main.cpp` 的 `kDefaultRotateCcw`（默认 90）。
+  0 = 不旋转，退回"等比缩小居中"的老行为。
+- ★ **窗口尺寸用「旋转后界面自己的包围盒」（1024x600），不要用屏幕尺寸**
+  —— 用屏幕尺寸的话桌面上会"窗口撑满整屏、界面缩在中间一圈空白"。
+- ★ **旋转分支里 `Widget` 必须 `new` 在堆上**：`scene.addWidget()` 把所有权交给
+  proxy，场景析构会 delete 它；栈对象会**双重释放，退出时段错误**。
+- ★ **`QTransform::rotate(+90)` 是顺时针，逆时针要写 `rotate(-90)`**（实测过，别按直觉）。
+- ★ **板子的 linuxfb 插件没有 rotation 支持**，`QT_QPA_PLATFORM=...:rotation=90` 无效。
+- ★ `Widget` 构造函数**必须固定 600x1024**（`designWidth/Height`），
+  屏幕适配全在 main.cpp 做 —— 尺寸在旋转前被改掉就凑不出 1024x600。
+- ★ 弹窗一律走 `noticeInfo()/noticeConfirm()`（内嵌遮罩+面板，跟着一起转）。
+  **不要用 QMessageBox**：它是独立顶层窗口不会转；
+  而且用 `setWindowFlags(Qt::Widget)` 把它变子控件会**段错误**。
+
 ## ★ TF 卡驱动现状（2026-10-14 改写，最重要）
 
 **`Core/Src/tf_card.c` 现在是 HAL_SD 版（765 行），不再是寄存器版。**
@@ -26,6 +46,41 @@
 ★ **教训**：寄存器版走了 4 轮硬件往返才定位到一半问题（ACMD41 的 R3 无 CRC7、
 CSD v1.0 位域、DMA 停流竞态、FIFO 残余），HAL_SD 版**一次就过**。
 下次遇到 SD/TF 卡，先考虑直接上 `HAL_SD`。细节见技能 `stm32-sdio-tf-card`。
+
+## ★ TF 卡"图像文件"读取（2026-10-15 新增）
+
+**需求**：Qt 导出灰度数组 -> 用户手动拷到 TF 卡 -> 固件读 -> 回显 Qt。
+用户边界：固件只读不写；`main.c` 不让动（交付环形缓冲，用户自己接）；
+回显用户已实现（`0x33 <灰度> 0xEE`）；Qt 只增不删。
+
+- **`Core/Src/tf_fat.c/h`** —— 极简 FAT12/16/32 **只读**查找器
+  （MBR -> 分区 -> BPB -> 根目录 -> 簇链）。**没有引 FatFs**
+  （工程没有 Middlewares；这里只需要"读根目录一个文件"）。
+  限制：只读 / 只找根目录 / 只认 8.3 短名须大写 / 不支持 FAT12 簇链。
+- **`Core/Src/tf_image.c/h`** —— 图像文件 + 大环形缓冲
+  （默认 32KB，宏 `TFIMG_RING_SIZE` 可调；工程 RAM 只用了约 11KB，余量很大）。
+  `TFIMG_Fill()` 尽量补满、`TFIMG_Get()` 取数，**两者解耦**——
+  卡的读取抖动不会顶到雕刻节奏上。`TFIMG_SelfTest()` 整份读一遍校验 CRC32。
+- **卡上文件格式**（两边约定）：`'GRY1' + u16宽 + u16高 + u32字节数 + u32CRC32 + 原始灰度字节`。
+  CRC-32/ISO-HDLC（0xEDB88320）。**Qt 和固件都是手写同一个算法**，改必须一起改。
+  文件名建议 **IMG.BIN**（8.3 短名大写），拷到卡根目录。
+- **Qt**（`Qt/widget.cpp/h`，只增不删）：新按钮「导出TF卡图像(.bin)」、
+  `buildCardImageBinary()`（与 `buildGrayArrayLines()` 同一套规则，
+  两种导出内容一致）、`onFbOpen()` 里的二进制分流（`m_fbSaveBinary`）。
+  回显监看（monitorBegin/Feed/End）用户自己写的，没动。
+- **`test.c` 新增 `test_tf_image()`**：不动 main.c 就能验证
+  "卡上文件读出来一个字节不差"（TFIMG_SelfTest + OLED + USART3 报告）。
+- **主机端测试 `F405RGT6/tools/tf_hosttest/`**：把 `TF_ReadBlocks()` 桩到
+  本地磁盘镜像上，用真源码跑全流程。`sh run.sh` 跑三组
+  （FAT16 / FAT32 / 512B 环形极限回绕），全绿。改 tf_fat.c/tf_image.c 先跑它。
+  ★ 它抓过两个真 bug：① MBR 循环里 `tf_parse_bpb()` 覆盖了正在遍历的
+    `s_datSec`（要先拷出分区表再循环）；
+  ② `dataSectors = totalSectors - dataStartLba` 里**分区内扇区数**和
+    **绝对 LBA** 基准混了 → 分区偏移越大簇数越少 → **FAT32 误判成 FAT16**，
+    簇链按 2 字节项解析读出垃圾。修法：减去 `(dataStartLba - partStartLba)`。
+    ★ 这条只在 FAT32 镜像上暴露，"只测自己用的那种卡"漏不掉它。
+- 环形缓冲用**单调递增 head/tail + 取模**：可读字节数直接 `head - tail`，
+  避开"满/空都是 head==tail"的经典歧义（代价：SIZE 必须 2 的幂，已用 #error 卡住）。
 
 ## 结构
 
@@ -129,3 +184,25 @@ CSD v1.0 位域、DMA 停流竞态、FIFO 残余），HAL_SD 版**一次就过**
 - `tf_card.c::TF_Test(doWriteTest)` —— 驱动自带自检，报告进日志缓冲后 OLED 分页轮播，
   现在是安全的（修好越界之后）。两者都可以用。
 
+
+## goto_point() 的语义（2026-10-16 查清，写代码前别再猜）
+
+`int goto_point(int x_point, int y_point);`  —— **绝对坐标，不是相对位移**。
+
+- 它把 `x.cur_point` / `y.cur_point` 这两个**当前坐标计数器**驱赶到
+  **等于**传入值：`if(x.cur_point > x_point)` 定方向、`while` 里等到
+  `x.cur_point == x_point` 才锁住停走。传的是"坐标"，不是"要挪多少"。
+- **原点**：`goto_home()` 结尾 `x.cur_point = 0; y.cur_point = 0;`
+  → 回零完成的那一刻就是 (0,0)。
+- 连续两次调用是**叠加到绝对坐标**：`goto_point(0,0)` 然后
+  `goto_point(500,10)` → 最终停在绝对 (500,10)，不会"再走 500"。
+
+几个容易踩的点：
+
+| 点 | 说明 |
+|---|---|
+| 返回值 | **成功 `1`、失败 `-1`，没有 0**。别写 `if(goto_point(...) != 0)` 判成功 |
+| 两轴同时走 | X/Y 的 `lock` 各自独立、同一个循环里一起发脉冲 → 走**斜线**，不是先 X 后 Y |
+| 限位保护 | 循环开头查四个限位，任一激活就 `goto_point_fail()` + `return -1` |
+| 超时 | `GOTO_POINT_TIMEOUT = 5*25000 = 125000` 次循环 × `BSP_DelayUs(40)` ≈ **5 秒**；每走 1 点要 `STEP_DIVIDE*6 = 96` 次循环 → **单次移动上限约 1300 个点**，超了就半路返回 -1 |
+| 副作用 | 进函数先 `laser_close()`；改的就是 `x.cur_point/y.cur_point`（和雕刻同一对计数器，所以它们始终是"当前实际坐标"） |

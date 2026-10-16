@@ -1,21 +1,29 @@
 /**
   ******************************************************************************
   * @file    tf_card.h
-  * @brief   TF(microSD) 卡槽驱动 —— 纯寄存器版 SDIO，4 位总线，全轮询
+  * @brief   TF(microSD) 卡槽驱动 —— **HAL_SD 版**（2026-10-14 改写）
   *
-  * 【为什么不用 HAL 的 SD 驱动】
-  *   本工程 stm32f4xx_hal_conf.h 里 HAL_SD_MODULE_ENABLED 是注释掉的，
-  *   且 stm32f4xx_hal_sd.c / stm32f4xx_ll_sdmmc.c 都没加进 Keil 工程，
-  *   编进去也是空的。所以这里直接操作 SDIO 寄存器，只依赖 CMSIS 和
-  *   基础 HAL（HAL_GetTick），不需要改工程里任何其它文件。
+  * 【这一版是什么】
+  *   2026-10-14 从"纯寄存器版 SDIO 驱动"整体改写成 ST 的 HAL_SD。
+  *   旧版（2800 行，自己发 CMD、自己解析 CSD、自己配 DMA）连踩了
+  *   ACMD41 的 R3 无 CRC7、CSD v1.0 位域、DMA 停流竞态、FIFO 残余一串坑；
+  *   HAL_SD 版一次跑通。旧版可取回：
+  *       git show b0e6c05:F405RGT6/Core/Src/tf_card.c
   *
-  * 【本文件对工程其它部分的侵入 —— 零】
-  *   只做三件事，且都不影响现有功能：
-  *     1. 打开 SDIO 时钟（RCC->APB2ENR.SDIOEN）—— 该外设原先没人用
-  *     2. 打开 GPIOD 时钟（若原先没开）—— 只是为了配 PD2
-  *     3. 把 PC8~PC12、PD2 配成 AF12(SDIO)
-  *   已核对 configure.h：PC0~PC5、PA8/PA15、PB13~PB15 是现有占用，
-  *   PC8~PC12 与 PD2 全部空闲，无冲突。
+  *   配套（都在本工程里了）：
+  *     - Core/Src/sdio.c          CubeMX 生成的 HAL_SD 初始化 + HAL_SD_MspInit
+  *     - stm32f4xx_hal_conf.h     已打开 HAL_SD_MODULE_ENABLED
+  *     - stm32f4xx_it.c           SDIO_IRQHandler + DMA2_Stream3/6_IRQHandler
+  *     - dma.c                    DMA2 时钟 + 这两个中断的 NVIC
+  *     - Keil 工程               已登记 sdio.c / stm32f4xx_hal_sd.c / stm32f4xx_ll_sdmmc.c
+  *
+  * 【和旧版相比，三个含义变了的地方】
+  *   1. g_tfLastSta 现在是 hsd.ErrorCode（HAL_SD 的错误位，见
+  *      stm32f4xx_ll_sdmmc.h 的 SDMMC_ERROR_*），不再是 SDIO->STA。
+  *   2. g_tfStep 粒度变粗：HAL_SD_Init() 一口气做完整个识别，
+  *      所以识别阶段只能标到 CLK_INIT。
+  *   3. 本版不做 CMD6 高速模式切换（HAL_SD 没有对应 API），
+  *      所以最高 24MHz，highSpeedMode 恒为 0，报告里 HS 显示 "--"。
   *
   * 【引脚映射（对应 TF 卡槽原理图）】
   *   CLK  -> PC12   (SDIO_CK)
@@ -27,12 +35,6 @@
   *   CD   -> 未连接，本驱动不依赖卡检测
   *   注意：4 位模式要求 DAT1/DAT2 也接上 —— 本板已接，故用 4 位。
   *
-  * 【时钟】
-  *   SDIOCLK = PLL48CLK。本工程 HSE=8M, PLLM=4, PLLN=168, PLLQ=7
-  *           => VCO = 8M/4*168 = 336MHz => PLL48CLK = 336/7 = 48MHz
-  *   SDIO_CK = SDIOCLK / (CLKDIV + 2)
-  *   CLKDIV 在运行时由 RCC->PLLCFGR 反推，不写死，换时钟树也不会错。
-  *
   * 【用法（三个调用点，都在你自己的 main.c 里加，本驱动不代劳）】
   *   1) 头文件：  #include "tf_card.h"
   *   2) 初始化：  TF_Status st = TF_Init();          // 放在外设都初始化完之后
@@ -41,7 +43,11 @@
   *   ★ 所有 API 内部都会自动补齐初始化（TF_EnsureInit），
   *     所以就算忘了先调 TF_Init() 也不会出错，最多多花一次识别时间。
   *
-  *   ★ Keil 里记得把 tf_card.c 加进工程（右键 Source Group -> Add Existing Files）。
+  *   ⚠ 不要同时调用 MX_SDIO_SD_Init() 和 TF_Init() —— 两套 SDIO 初始化会打架。
+  *     本驱动自己配 hsd 再调 HAL_SD_Init()，不走 MX_SDIO_SD_Init()
+  *     （那个函数失败会直接 Error_Handler() 停机，驱动需要能返回错误码）。
+  *
+  *   ★ 想读 TF 卡上的文件（而不只是扇区），用同目录的 tf_fat.c / tf_image.c。
   ******************************************************************************
   */
 

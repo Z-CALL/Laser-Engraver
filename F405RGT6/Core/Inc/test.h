@@ -18,6 +18,7 @@ void test_delay();
 void test_homing();
 void test_go_to_point();
 void test_tf_card(void);
+void test_tf_image(void);   /* ★ 从 TF 卡读 IMG.BIN 并校验 CRC32 */
 
 #ifdef __cplusplus
 }
